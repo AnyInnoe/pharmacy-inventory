@@ -153,13 +153,19 @@ AuditEvent *---0..1 Branch; *---0..1 User
 - Barcode aliases resolve to a product; scanning never substitutes for lot/expiry verification.
 - POS, insurer, and patient-system connectivity are integration boundaries. Do not claim an integration until its external contract, privacy requirements, and reconciliation behavior are defined.
 
-## Delivery slices
+## Delivery status
 
-1. **Foundation (in progress):** branch-scoped catalog/lots, receiving, FEFO stock dispensing, stock counts, supplier invoices/payments, sales/payments, audit trail, persistence, and tests.
-2. **Operations:** purchase orders/receiving reconciliation, richer product administration, barcode aliases and scan UX, transfer request/dispatch/receipt.
-3. **Prescription and compliance:** prescription validation/dispensing, controlled-medicine register and witness workflow, configurable policies and retention.
-4. **Integrations and analytics:** POS/claims/patient integration after contracts and privacy review; operational reports and exports.
+- **Foundation:** implemented in the Django API and React dashboard: branch-scoped catalog and lots, stock receiving and dispensing, stock counts, sales and payments, supplier invoices and payments, audit events, and role-based branch access.
+- **Operations:** internal workflows implemented for purchase orders, reorder suggestions and drafts, supplier/product terms, receiving, barcode lookup and aliases, and branch transfer request/dispatch/receipt.
+- **Prescriptions and compliance controls:** internal prescription intake, verification and dispensing; configurable per-branch policies; controlled-medicine register and witness controls. The default jurisdiction code is `UG`, but the software does not establish regulatory compliance.
+- **Analytics:** operational summaries and movement CSV export are available. These are not statutory reports.
+- **External integrations:** provider-neutral event records and internal boundaries exist. No POS, insurer, billing, or patient-system provider has been selected or connected, so there is no live external integration.
 
-## Current implementation boundary
+## Implementation boundaries and release checklist
 
-The first delivery slice is being wired into the Django API and React dashboard. Prescription integration, controlled-substance operations, scanning hardware, purchase orders, transfers, and external POS/claims/patient integrations are design targets, not implemented or certified capabilities yet. Compliance requirements vary by jurisdiction and must be reviewed before production use.
+- Configure a branch policy only after review by qualified Uganda pharmacy/regulatory stakeholders. Requirements, retention periods, and controlled-medicine rules must be verified independently before production use.
+- External POS, insurance, billing, and patient-system integrations require a named provider, API contract, credentials, privacy/security review, event delivery/retry, and reconciliation behavior.
+- Barcode lookup accepts scanner keyboard input; hardware-specific device integrations are not included.
+- Transfers currently allocate one source lot per product line. Split-lot allocation is not supported.
+- Purchase order receipt records quantities, lots, expiry, and price, but supplier invoice reconciliation is a separate workflow.
+- Run migrations, tests, and production configuration checks before deployment; development defaults are not production-ready.

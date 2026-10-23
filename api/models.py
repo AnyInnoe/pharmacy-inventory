@@ -18,6 +18,24 @@ class Branch(models.Model):
         return f"{self.code} — {self.name}"
 
 
+class BranchCompliancePolicy(models.Model):
+    branch = models.OneToOneField(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="compliance_policy",
+    )
+    jurisdiction_code = models.CharField(max_length=8, default="UG")
+    max_prescription_age_days = models.PositiveIntegerField(null=True, blank=True)
+    require_prescriber_registration = models.BooleanField(default=False)
+    require_expiry_date_on_prescription = models.BooleanField(default=False)
+    controlled_witness_required = models.BooleanField(default=True)
+    require_patient_reference = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.branch.code} — {self.jurisdiction_code} policy"
+
+
 class BranchMembership(models.Model):
     class Role(models.TextChoices):
         PHARMACIST = "pharmacist", "Pharmacist"
@@ -137,6 +155,21 @@ class MedicationProduct(models.Model):
         return f"{self.sku} — {self.name}"
 
 
+class BarcodeAlias(models.Model):
+    product = models.ForeignKey(
+        MedicationProduct,
+        on_delete=models.PROTECT,
+        related_name="barcode_aliases",
+    )
+    value = models.CharField(max_length=80, unique=True)
+    symbology = models.CharField(max_length=32, blank=True)
+    is_primary = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.value} — {self.product.sku}"
+
+
 class MedicineBatch(models.Model):
     branch = models.ForeignKey(
         Branch,
@@ -178,6 +211,9 @@ class StockMovement(models.Model):
         SALE = "Sale", "Sale"
         NON_SALE_ISSUE = "Non-sale issue", "Non-sale issue"
         STOCK_COUNT = "Stock count adjustment", "Stock count adjustment"
+        WASTE = "Waste", "Waste"
+        TRANSFER_OUT = "Transfer out", "Transfer out"
+        TRANSFER_IN = "Transfer in", "Transfer in"
 
     branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="stock_movements")
     batch = models.ForeignKey(
@@ -246,7 +282,101 @@ class SaleLine(models.Model):
     selling_price = models.DecimalField(max_digits=12, decimal_places=2)
 
 
+class Supplier(models.Model):
+    name = models.CharField(max_length=160)
+    contact_name = models.CharField(max_length=120, blank=True)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=40, blank=True)
+    address = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(fields=["name"], name="unique_supplier_name")
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class SupplierProduct(models.Model):
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="catalog_items")
+    product = models.ForeignKey(MedicationProduct, on_delete=models.PROTECT, related_name="supplier_options")
+    supplier_sku = models.CharField(max_length=80, blank=True)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+    lead_time_days = models.PositiveIntegerField(default=0)
+    is_preferred = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["supplier", "product"],
+                name="unique_supplier_product",
+            )
+        ]
+
+
+class PurchaseOrder(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+        PARTIALLY_RECEIVED = "partially_received", "Partially received"
+        RECEIVED = "received", "Received"
+        CANCELLED = "cancelled", "Cancelled"
+
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="purchase_orders")
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="purchase_orders")
+    number = models.CharField(max_length=40)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.DRAFT)
+    expected_date = models.DateField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="created_purchase_orders",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["branch", "number"], name="unique_branch_po_number")
+        ]
+
+
+class PurchaseOrderLine(models.Model):
+    purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.PROTECT, related_name="lines")
+    product = models.ForeignKey(MedicationProduct, on_delete=models.PROTECT, related_name="purchase_order_lines")
+    quantity_ordered = models.PositiveIntegerField()
+    quantity_received = models.PositiveIntegerField(default=0)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["purchase_order", "product"],
+                name="unique_product_per_purchase_order",
+            )
+        ]
+
+
 class SupplierInvoice(models.Model):
+    supplier_record = models.ForeignKey(
+        Supplier,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="invoices",
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="invoices",
+    )
     branch = models.ForeignKey(
         Branch,
         on_delete=models.PROTECT,
@@ -305,3 +435,197 @@ class CustomerPayment(models.Model):
         null=True,
         related_name="recorded_customer_payments",
     )
+
+
+class Prescription(models.Model):
+    class Status(models.TextChoices):
+        RECEIVED = "received", "Received"
+        VERIFIED = "verified", "Verified"
+        PARTIALLY_DISPENSED = "partially_dispensed", "Partially dispensed"
+        DISPENSED = "dispensed", "Dispensed"
+        REJECTED = "rejected", "Rejected"
+
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="prescriptions")
+    reference = models.CharField(max_length=100)
+    patient_reference = models.CharField(max_length=100)
+    prescriber_name = models.CharField(max_length=160)
+    prescriber_registration = models.CharField(max_length=100, blank=True)
+    issued_date = models.DateField()
+    expires_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.RECEIVED)
+    notes = models.TextField(blank=True)
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="received_prescriptions",
+    )
+    verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="verified_prescriptions",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "reference"],
+                name="unique_branch_prescription_reference",
+            )
+        ]
+
+
+class PrescriptionLine(models.Model):
+    prescription = models.ForeignKey(Prescription, on_delete=models.PROTECT, related_name="lines")
+    product = models.ForeignKey(MedicationProduct, on_delete=models.PROTECT, related_name="prescription_lines")
+    directions = models.CharField(max_length=240, blank=True)
+    quantity_prescribed = models.PositiveIntegerField()
+    quantity_dispensed = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["prescription", "product"],
+                name="unique_product_per_prescription",
+            )
+        ]
+
+
+class DispenseLine(models.Model):
+    prescription_line = models.ForeignKey(
+        PrescriptionLine,
+        on_delete=models.PROTECT,
+        related_name="dispenses",
+    )
+    sale_line = models.ForeignKey(
+        SaleLine,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="prescription_dispenses",
+    )
+    batch = models.ForeignKey(MedicineBatch, on_delete=models.PROTECT, related_name="prescription_dispenses")
+    quantity = models.PositiveIntegerField()
+    dispensed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="prescription_dispenses",
+    )
+    dispensed_at = models.DateTimeField(auto_now_add=True)
+
+
+class ControlledDrugRegisterEntry(models.Model):
+    movement = models.OneToOneField(
+        StockMovement,
+        on_delete=models.PROTECT,
+        related_name="controlled_register_entry",
+    )
+    witness = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="witnessed_controlled_movements",
+    )
+    patient_reference = models.CharField(max_length=100, blank=True)
+    prescriber_reference = models.CharField(max_length=100, blank=True)
+    balance_after = models.PositiveIntegerField()
+    notes = models.TextField(blank=True)
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+
+class BranchTransfer(models.Model):
+    class Status(models.TextChoices):
+        REQUESTED = "requested", "Requested"
+        DISPATCHED = "dispatched", "Dispatched"
+        PARTIALLY_RECEIVED = "partially_received", "Partially received"
+        RECEIVED = "received", "Received"
+        CANCELLED = "cancelled", "Cancelled"
+
+    source_branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="outgoing_transfers")
+    destination_branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="incoming_transfers")
+    reference = models.CharField(max_length=100)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.REQUESTED)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="requested_transfers",
+    )
+    dispatched_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="dispatched_transfers",
+    )
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="received_transfers",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source_branch", "reference"],
+                name="unique_transfer_reference_per_source",
+            )
+        ]
+
+
+class BranchTransferLine(models.Model):
+    transfer = models.ForeignKey(BranchTransfer, on_delete=models.PROTECT, related_name="lines")
+    product = models.ForeignKey(MedicationProduct, on_delete=models.PROTECT, related_name="transfer_lines")
+    source_batch = models.ForeignKey(
+        MedicineBatch,
+        on_delete=models.PROTECT,
+        related_name="transfer_out_lines",
+    )
+    destination_batch = models.ForeignKey(
+        MedicineBatch,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="transfer_in_lines",
+    )
+    quantity_dispatched = models.PositiveIntegerField()
+    quantity_received = models.PositiveIntegerField(default=0)
+
+
+class ExternalIntegrationEvent(models.Model):
+    class Direction(models.TextChoices):
+        INBOUND = "inbound", "Inbound"
+        OUTBOUND = "outbound", "Outbound"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSED = "processed", "Processed"
+        FAILED = "failed", "Failed"
+
+    provider = models.CharField(max_length=80)
+    external_id = models.CharField(max_length=120)
+    direction = models.CharField(max_length=12, choices=Direction.choices)
+    event_type = models.CharField(max_length=80)
+    payload = models.JSONField()
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "external_id", "direction"],
+                name="unique_external_integration_event",
+            )
+        ]

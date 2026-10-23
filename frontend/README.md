@@ -35,5 +35,6 @@ tests from the repository root with
 The Django settings currently use development defaults. Before deployment,
 configure secrets, `DEBUG`, allowed hosts, HTTPS/secure cookies, database
 backups, static files, logging, and environment-specific CSRF trusted origins.
-See [the project wireframe](../docs/PROJECT-WIREFRAME.md) for planned modules
-and capabilities that are not yet implemented.
+See [the project wireframe](../docs/PROJECT-WIREFRAME.md) for the implemented
+internal workflows, jurisdiction and integration boundaries, and remaining
+release limitations.
