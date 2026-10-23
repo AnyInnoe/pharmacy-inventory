@@ -14,6 +14,8 @@ from .models import (
     ExternalIntegrationEvent,
     MedicineBatch,
     MedicationProduct,
+    PurchaseOrder,
+    PurchaseOrderLine,
     Prescription,
     Sale,
     SaleLine,
@@ -188,6 +190,61 @@ class InventoryApiTests(TestCase):
         invoice.refresh_from_db()
         self.assertEqual(invoice.amount_paid, 100)
         self.assertEqual(SupplierPayment.objects.count(), 2)
+
+    def test_linked_supplier_invoice_reconciliation_requires_complete_receipt(self):
+        self.make_manager()
+        self.create_batch()
+        product = MedicationProduct.objects.get(sku="MED-001")
+        supplier = Supplier.objects.create(name="Reconciliation supplier")
+        order = PurchaseOrder.objects.create(
+            branch=self.branch,
+            supplier=supplier,
+            number="PO-RECON",
+            status=PurchaseOrder.Status.SUBMITTED,
+            created_by=self.user,
+        )
+        PurchaseOrderLine.objects.create(
+            purchase_order=order,
+            product=product,
+            quantity_ordered=3,
+            quantity_received=3,
+            unit_cost="2.50",
+        )
+        invoice = SupplierInvoice.objects.create(
+            branch=self.branch,
+            supplier_record=supplier,
+            purchase_order=order,
+            supplier=supplier.name,
+            invoice_number="INV-RECON",
+            invoice_amount="7.50",
+            due_date=date(2030, 1, 1),
+            actor=self.user,
+        )
+        pending = self.post_json(
+            f"/api/supplier-invoices/{invoice.id}/reconcile/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(pending.status_code, 409)
+
+        order.status = PurchaseOrder.Status.RECEIVED
+        order.save(update_fields=["status"])
+        matched = self.post_json(
+            f"/api/supplier-invoices/{invoice.id}/reconcile/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(matched.status_code, 200, matched.content)
+        self.assertEqual(matched.json()["invoice"]["reconciliationStatus"], "matched")
+        self.assertEqual(matched.json()["invoice"]["reconciledExpectedAmount"], 7.5)
+
+        invoice.invoice_amount = "8.00"
+        invoice.save(update_fields=["invoice_amount"])
+        variance = self.post_json(
+            f"/api/supplier-invoices/{invoice.id}/reconcile/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(variance.status_code, 200, variance.content)
+        self.assertEqual(variance.json()["invoice"]["reconciliationStatus"], "variance")
+        self.assertEqual(variance.json()["invoice"]["reconciliationVariance"], 0.5)
 
     def test_controlled_product_cannot_use_regular_dispense_flow(self):
         self.create_batch()
@@ -387,6 +444,77 @@ class InventoryApiTests(TestCase):
         self.assertEqual(BranchTransfer.objects.get().status, BranchTransfer.Status.RECEIVED)
         self.assertEqual(
             StockMovement.objects.filter(type=StockMovement.Type.TRANSFER_IN).get().quantity,
+            3,
+        )
+
+    def test_branch_transfer_allocates_multiple_lots_and_allows_partial_receipt(self):
+        self.make_manager()
+        self.create_batch(quantity=5, batch="LOT-FIRST", expiry="2030-01-01")
+        product = MedicationProduct.objects.get(sku="MED-001")
+        later_lot = MedicineBatch.objects.create(
+            branch=self.branch,
+            product=product,
+            batch="LOT-SECOND",
+            quantity=5,
+            reorder_level=0,
+            expiry=date(2030, 2, 1),
+            supplier="Supplier A",
+            reference="RECEIPT-SECOND",
+            purchase_cost="2.00",
+            selling_price="5.00",
+        )
+        destination = Branch.objects.create(name="South", code="SOUTH")
+        BranchMembership.objects.create(
+            user=self.user,
+            branch=destination,
+            role=BranchMembership.Role.BRANCH_MANAGER,
+        )
+        create = self.post_json(
+            "/api/transfers/create/",
+            {
+                "sourceBranchId": self.branch.id,
+                "destinationBranchId": destination.id,
+                "reference": "TR-SPLIT",
+                "lines": [{"sku": "MED-001", "quantity": 8}],
+            },
+        )
+        self.assertEqual(create.status_code, 201, create.content)
+        transfer = BranchTransfer.objects.get()
+        lines = list(transfer.lines.order_by("source_batch__expiry"))
+        self.assertEqual(len(lines), 2)
+        self.assertEqual([line.quantity_dispatched for line in lines], [5, 3])
+        self.assertEqual(lines[0].source_batch.batch, "LOT-FIRST")
+        self.assertEqual(lines[1].source_batch_id, later_lot.id)
+
+        dispatch = self.post_json(
+            f"/api/transfers/{transfer.id}/dispatch/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(dispatch.status_code, 200, dispatch.content)
+        first_receipt = self.post_json(
+            f"/api/transfers/{transfer.id}/receive/",
+            {
+                "branchId": destination.id,
+                "quantities": {str(lines[0].id): 2, str(lines[1].id): 0},
+            },
+        )
+        self.assertEqual(first_receipt.status_code, 200, first_receipt.content)
+        self.assertEqual(first_receipt.json()["status"], BranchTransfer.Status.PARTIALLY_RECEIVED)
+        lines[0].refresh_from_db()
+        self.assertEqual(lines[0].quantity_received, 2)
+        self.assertEqual(MedicineBatch.objects.get(pk=lines[0].destination_batch_id).quantity, 2)
+
+        final_receipt = self.post_json(
+            f"/api/transfers/{transfer.id}/receive/",
+            {"branchId": destination.id},
+        )
+        self.assertEqual(final_receipt.status_code, 200, final_receipt.content)
+        self.assertEqual(final_receipt.json()["status"], BranchTransfer.Status.RECEIVED)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.lines.get(pk=lines[0].id).quantity_received, 5)
+        self.assertEqual(transfer.lines.get(pk=lines[1].id).quantity_received, 3)
+        self.assertEqual(
+            StockMovement.objects.filter(branch=destination, type=StockMovement.Type.TRANSFER_IN).count(),
             3,
         )
 

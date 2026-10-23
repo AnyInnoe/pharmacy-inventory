@@ -24,6 +24,11 @@ urlpatterns = [
         views.supplier_payment,
         name="supplier-payment",
     ),
+    path(
+        "supplier-invoices/<int:invoice_id>/reconcile/",
+        views.reconcile_supplier_invoice,
+        name="reconcile-supplier-invoice",
+    ),
     path("sales/<int:sale_id>/payments/", views.customer_payment, name="customer-payment"),
     path("barcode/lookup/", views.barcode_lookup, name="barcode-lookup"),
     path("barcode/aliases/", views.add_barcode_alias, name="barcode-alias"),

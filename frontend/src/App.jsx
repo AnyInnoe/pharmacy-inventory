@@ -273,7 +273,8 @@ function App() {
   const [purchaseOrderForm, setPurchaseOrderForm] = useState(emptyPurchaseOrder)
   const [purchaseReceiptForm, setPurchaseReceiptForm] = useState(emptyPurchaseReceipt)
   const [transferForm, setTransferForm] = useState(emptyTransfer)
-  const [transferBatch, setTransferBatch] = useState('')
+  const [transferReceiptQuantities, setTransferReceiptQuantities] = useState({})
+  const [transferReceiptBatches, setTransferReceiptBatches] = useState({})
   const [transferWitnessId, setTransferWitnessId] = useState('')
   const [productForm, setProductForm] = useState(emptyProduct)
   const [barcodeAliasForm, setBarcodeAliasForm] = useState(emptyBarcodeAlias)
@@ -814,6 +815,15 @@ function App() {
     }
   }
 
+  async function handleReconcileSupplierInvoice(invoiceId) {
+    setWorkflowError('')
+    try {
+      await saveBranchAction(`/api/supplier-invoices/${invoiceId}/reconcile/`, {})
+    } catch (error) {
+      setWorkflowError(error.message || 'Could not reconcile the supplier invoice.')
+    }
+  }
+
   function handleCustomerPaymentChange(event) {
     const { name, value } = event.target
     setCustomerPaymentForm((current) => ({ ...current, [name]: value }))
@@ -1067,14 +1077,31 @@ function App() {
   async function handleTransferAction(transferId, action, branchId = activeBranchId) {
     setWorkflowError('')
     try {
+      const transfer = transfers.find((item) => item.id === transferId)
       await saveBranchAction(`/api/transfers/${transferId}/${action}/`, {
         branchId: Number(branchId),
         witnessId: transferWitnessId || null,
-        ...(action === 'receive' && transferBatch
-          ? { batches: { [String(transfers.find((item) => item.id === transferId)?.lines[0]?.id)]: transferBatch } }
+        ...(action === 'receive' && transfer
+          ? {
+              quantities: Object.fromEntries(transfer.lines
+                .filter((line) => line.quantityOutstanding > 0)
+                .map((line) => [
+                  String(line.id),
+                  Number(transferReceiptQuantities[line.id] ?? line.quantityOutstanding),
+                ])),
+              batches: Object.fromEntries(transfer.lines
+                .filter((line) => line.quantityOutstanding > 0)
+                .map((line) => [
+                  String(line.id),
+                  transferReceiptBatches[line.id] || line.destinationBatch || line.batch,
+                ])),
+            }
           : {}),
       })
-      setTransferBatch('')
+      if (action === 'receive') {
+        setTransferReceiptQuantities({})
+        setTransferReceiptBatches({})
+      }
     } catch (error) {
       setWorkflowError(error.message || `Could not ${action} transfer.`)
     }
@@ -1965,15 +1992,20 @@ function App() {
               </section>
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Branch transfers</h2><p>Dispatch from source and confirm receipt at destination.</p></div></div>
-                <label className="transfer-lot-input">Destination lot number (optional)
-                  <input value={transferBatch} onChange={(event) => setTransferBatch(event.target.value)} placeholder="Defaults to source lot" />
-                </label>
                 {transfers.some((item) => (item.status === 'dispatched' && String(item.destinationBranchId) === String(activeBranchId) || item.status === 'requested' && String(item.sourceBranchId) === String(activeBranchId)) && item.lines.some((line) => line.isControlled)) && <label className="transfer-lot-input">Controlled stock movement witness
                   <select value={transferWitnessId} onChange={(event) => setTransferWitnessId(event.target.value)}><option value="">Select witness</option>{branchStaff.filter((member) => member.id !== currentUser.id).map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
                 </label>}
                 <table><thead><tr><th>Reference</th><th>From</th><th>To</th><th>Items</th><th>Status</th><th>Action</th></tr></thead><tbody>
-                  {transfers.map((item) => <tr key={item.id}><td>{item.reference}</td><td>{item.sourceBranch}</td><td>{item.destinationBranch}</td><td>{item.lines.map((line) => `${line.sku} ${line.quantityDispatched}`).join('; ')}</td><td>{item.status}</td>
-                    <td>{canManageBranch && item.status === 'requested' && String(item.sourceBranchId) === String(activeBranchId) && <button type="button" onClick={() => handleTransferAction(item.id, 'dispatch')}>Dispatch</button>}{canManageBranch && item.status === 'dispatched' && String(item.destinationBranchId) === String(activeBranchId) && <button type="button" onClick={() => handleTransferAction(item.id, 'receive')}>Confirm receipt</button>}</td>
+                  {transfers.map((item) => <tr key={item.id}><td>{item.reference}</td><td>{item.sourceBranch}</td><td>{item.destinationBranch}</td><td>{item.lines.map((line) => (
+                    <div key={line.id} className="transfer-line">
+                      <span>{line.sku} · {line.quantityReceived}/{line.quantityDispatched} received · lot {line.destinationBatch || line.batch}</span>
+                      {canManageBranch && ['dispatched', 'partially_received'].includes(item.status) && String(item.destinationBranchId) === String(activeBranchId) && line.quantityOutstanding > 0 && <>
+                        <label>Receive<input type="number" min="0" max={line.quantityOutstanding} step="1" value={transferReceiptQuantities[line.id] ?? line.quantityOutstanding} onChange={(event) => setTransferReceiptQuantities((current) => ({ ...current, [line.id]: event.target.value }))} /></label>
+                        <label>Destination lot<input value={transferReceiptBatches[line.id] ?? line.destinationBatch ?? line.batch} onChange={(event) => setTransferReceiptBatches((current) => ({ ...current, [line.id]: event.target.value }))} /></label>
+                      </>}
+                    </div>
+                  ))}</td><td>{item.status}</td>
+                    <td>{canManageBranch && item.status === 'requested' && String(item.sourceBranchId) === String(activeBranchId) && <button type="button" onClick={() => handleTransferAction(item.id, 'dispatch')}>Dispatch</button>}{canManageBranch && ['dispatched', 'partially_received'].includes(item.status) && String(item.destinationBranchId) === String(activeBranchId) && <button type="button" onClick={() => handleTransferAction(item.id, 'receive')}>Receive selected quantities</button>}</td>
                   </tr>)}
                   {!transfers.length && <tr><td colSpan="6">No transfers involving this branch.</td></tr>}
                 </tbody></table>
@@ -2031,18 +2063,21 @@ function App() {
                 )}
 
                 <table>
-                  <thead><tr><th>Supplier</th><th>Invoice</th><th>Invoice total</th><th>Paid</th><th>Balance</th><th>Due date</th><th>Status</th></tr></thead>
+                  <thead><tr><th>Supplier</th><th>Invoice</th><th>Invoice total</th><th>Paid</th><th>Balance</th><th>Due date</th><th>Payment status</th><th>Reconciliation</th><th>Action</th></tr></thead>
                   <tbody>
                     {supplierInvoices.map((invoice) => {
                       const balance = invoice.invoiceAmount - invoice.amountPaid
                       const status = getSupplierInvoiceStatus(invoice)
+                      const linkedOrder = purchaseOrders.find((order) => String(order.id) === String(invoice.purchaseOrderId))
                       return <tr key={invoice.id}>
                         <td>{invoice.supplier}</td><td>{invoice.invoiceNumber}</td>
                         <td>{invoice.invoiceAmount.toLocaleString()}</td><td>{invoice.amountPaid.toLocaleString()}</td>
                         <td>{balance.toLocaleString()}</td><td>{invoice.dueDate}</td><td>{status}</td>
+                        <td>{invoice.purchaseOrderId ? `${invoice.reconciliationStatus}${invoice.reconciledExpectedAmount !== null ? ` · expected ${invoice.reconciledExpectedAmount.toLocaleString()} · variance ${invoice.reconciliationVariance.toLocaleString()}` : ''}` : 'Not linked to an order'}</td>
+                        <td>{canManageBranch && linkedOrder?.status === 'received' && <button type="button" onClick={() => handleReconcileSupplierInvoice(invoice.id)}>Reconcile</button>}</td>
                       </tr>
                     })}
-                    {supplierInvoices.length === 0 && <tr><td colSpan="7">No supplier invoices recorded yet.</td></tr>}
+                    {supplierInvoices.length === 0 && <tr><td colSpan="9">No supplier invoices recorded yet.</td></tr>}
                   </tbody>
                 </table>
               </section>

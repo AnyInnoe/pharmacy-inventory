@@ -363,6 +363,12 @@ class PurchaseOrderLine(models.Model):
 
 
 class SupplierInvoice(models.Model):
+    class ReconciliationStatus(models.TextChoices):
+        NOT_LINKED = "not_linked", "Not linked"
+        PENDING = "pending", "Pending"
+        MATCHED = "matched", "Matched"
+        VARIANCE = "variance", "Variance"
+
     supplier_record = models.ForeignKey(
         Supplier,
         on_delete=models.PROTECT,
@@ -387,6 +393,24 @@ class SupplierInvoice(models.Model):
     invoice_amount = models.DecimalField(max_digits=12, decimal_places=2)
     amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     due_date = models.DateField()
+    reconciliation_status = models.CharField(
+        max_length=16,
+        choices=ReconciliationStatus.choices,
+        default=ReconciliationStatus.NOT_LINKED,
+    )
+    reconciled_expected_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    reconciliation_variance = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    reconciled_at = models.DateTimeField(null=True, blank=True)
     actor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

@@ -267,6 +267,18 @@ def _invoice_data(invoice):
         "dueDate": invoice.due_date.isoformat(),
         "createdAt": invoice.created_at.isoformat(),
         "purchaseOrderId": invoice.purchase_order_id,
+        "reconciliationStatus": invoice.reconciliation_status,
+        "reconciledExpectedAmount": (
+            float(invoice.reconciled_expected_amount)
+            if invoice.reconciled_expected_amount is not None
+            else None
+        ),
+        "reconciliationVariance": (
+            float(invoice.reconciliation_variance)
+            if invoice.reconciliation_variance is not None
+            else None
+        ),
+        "reconciledAt": invoice.reconciled_at.isoformat() if invoice.reconciled_at else None,
     }
 
 
@@ -882,6 +894,75 @@ def supplier_payment(request, invoice_id):
         )
         _record_audit(request, branch, AuditEvent.Action.PAYMENT_RECORDED, "supplier_invoice", invoice.pk, {"amountPaid": float(invoice.amount_paid)}, reference)
     return JsonResponse({"paymentId": payment.pk}, status=201)
+
+
+@require_POST
+def reconcile_supplier_invoice(request, invoice_id):
+    data, error = _json_body(request)
+    if error:
+        return error
+    branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"branch_manager"})
+    if error:
+        return error
+    with transaction.atomic():
+        try:
+            invoice = SupplierInvoice.objects.select_for_update().select_related(
+                "purchase_order",
+            ).get(pk=invoice_id, branch=branch)
+        except SupplierInvoice.DoesNotExist:
+            return JsonResponse({"detail": "Invoice not found."}, status=404)
+        if invoice.purchase_order is None:
+            return JsonResponse(
+                {"detail": "Link this invoice to a purchase order before reconciling."},
+                status=409,
+            )
+        order = invoice.purchase_order
+        if order.status != PurchaseOrder.Status.RECEIVED:
+            return JsonResponse(
+                {"detail": "Receive the complete purchase order before reconciling its invoice."},
+                status=409,
+            )
+        expected_amount = sum(
+            (
+                line.unit_cost * line.quantity_received
+                for line in order.lines.all()
+            ),
+            Decimal("0.00"),
+        ).quantize(Decimal("0.01"))
+        variance = (invoice.invoice_amount - expected_amount).quantize(Decimal("0.01"))
+        invoice.reconciliation_status = (
+            SupplierInvoice.ReconciliationStatus.MATCHED
+            if abs(variance) <= Decimal("0.01")
+            else SupplierInvoice.ReconciliationStatus.VARIANCE
+        )
+        invoice.reconciled_expected_amount = expected_amount
+        invoice.reconciliation_variance = variance
+        invoice.reconciled_at = timezone.now()
+        invoice.save(
+            update_fields=[
+                "reconciliation_status",
+                "reconciled_expected_amount",
+                "reconciliation_variance",
+                "reconciled_at",
+            ]
+        )
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.UPDATED,
+            "supplier_invoice",
+            invoice.pk,
+            {
+                "reconciliationStatus": invoice.reconciliation_status,
+                "expectedAmount": str(expected_amount),
+                "variance": str(variance),
+            },
+            invoice.invoice_number,
+        )
+    return JsonResponse({"invoice": _invoice_data(invoice)})
 
 
 @require_POST
@@ -1608,34 +1689,45 @@ def create_transfer(request):
             return JsonResponse({"detail": "Each transfer line needs an active SKU and whole-number quantity."}, status=400)
         if quantity <= 0 or product.pk in seen:
             return JsonResponse({"detail": "Transfer quantities must be positive and products may appear once."}, status=400)
-        source_batch = MedicineBatch.objects.filter(
+        eligible_batches = list(MedicineBatch.objects.filter(
             branch=source,
             product=product,
-            quantity__gte=quantity,
+            quantity__gt=0,
             expiry__gte=date.today(),
-        ).order_by("expiry", "id").first()
-        if source_batch is None:
+        ).order_by("expiry", "id"))
+        available_quantity = sum(batch.quantity for batch in eligible_batches)
+        if available_quantity < quantity:
             return JsonResponse(
-                {"detail": f"No single eligible lot can fulfill the transfer for {product.sku}."},
+                {"detail": f"Insufficient eligible stock for {product.sku}."},
                 status=400,
             )
         seen.add(product.pk)
-        parsed.append((product, quantity, source_batch))
-    transfer = BranchTransfer.objects.create(
-        source_branch=source,
-        destination_branch=destination,
-        reference=reference,
-        requested_by=request.user,
-    )
-    transfer.lines.bulk_create([
-        BranchTransferLine(
-            transfer=transfer,
-            product=product,
-            source_batch=source_batch,
-            quantity_dispatched=quantity,
+        outstanding = quantity
+        for source_batch in eligible_batches:
+            allocated = min(source_batch.quantity, outstanding)
+            if allocated:
+                parsed.append((product, allocated, source_batch))
+                outstanding -= allocated
+            if outstanding == 0:
+                break
+    if BranchTransfer.objects.filter(source_branch=source, reference__iexact=reference).exists():
+        return JsonResponse({"detail": "That transfer reference has already been used."}, status=409)
+    with transaction.atomic():
+        transfer = BranchTransfer.objects.create(
+            source_branch=source,
+            destination_branch=destination,
+            reference=reference,
+            requested_by=request.user,
         )
-        for product, quantity, source_batch in parsed
-    ])
+        transfer.lines.bulk_create([
+            BranchTransferLine(
+                transfer=transfer,
+                product=product,
+                source_batch=source_batch,
+                quantity_dispatched=quantity,
+            )
+            for product, quantity, source_batch in parsed
+        ])
     _record_audit(request, source, AuditEvent.Action.CREATED, "branch_transfer", transfer.pk, {"destination": destination.code}, reference)
     return JsonResponse({"id": transfer.pk, "status": transfer.status}, status=201)
 
@@ -1647,7 +1739,11 @@ def transfers_view(request):
         return error
     transfers = BranchTransfer.objects.filter(
         models.Q(source_branch=branch) | models.Q(destination_branch=branch)
-    ).select_related("source_branch", "destination_branch").prefetch_related("lines__product", "lines__source_batch")
+    ).select_related("source_branch", "destination_branch").prefetch_related(
+        "lines__product",
+        "lines__source_batch",
+        "lines__destination_batch",
+    )
     return JsonResponse({"transfers": [
         {
             "id": transfer.id,
@@ -1663,8 +1759,10 @@ def transfers_view(request):
                     "sku": line.product.sku,
                     "name": line.product.name,
                     "batch": line.source_batch.batch,
+                    "destinationBatch": line.destination_batch.batch if line.destination_batch_id else "",
                     "quantityDispatched": line.quantity_dispatched,
                     "quantityReceived": line.quantity_received,
+                    "quantityOutstanding": line.quantity_dispatched - line.quantity_received,
                     "isControlled": line.product.is_controlled,
                 }
                 for line in transfer.lines.all()
@@ -1762,18 +1860,50 @@ def receive_transfer(request, transfer_id):
             )
         except BranchTransfer.DoesNotExist:
             return JsonResponse({"detail": "Transfer not found."}, status=404)
-        if transfer.status != BranchTransfer.Status.DISPATCHED:
-            return JsonResponse({"detail": "Only dispatched transfers can be received."}, status=409)
+        if transfer.status not in (
+            BranchTransfer.Status.DISPATCHED,
+            BranchTransfer.Status.PARTIALLY_RECEIVED,
+        ):
+            return JsonResponse({"detail": "Only dispatched or partially received transfers can be received."}, status=409)
         lines = list(transfer.lines.select_related("product", "source_batch").all())
-        batch_names = []
+        quantity_map = data.get("quantities", {})
         batch_map = data.get("batches", {})
-        if not isinstance(batch_map, dict):
-            return JsonResponse({"detail": "Batch names must be provided as a line-to-batch map."}, status=400)
+        if not isinstance(quantity_map, dict) or not isinstance(batch_map, dict):
+            return JsonResponse({"detail": "Receipt quantities and batch names must be line maps."}, status=400)
+        receipts = []
+        batch_names = []
         for line in lines:
+            outstanding = line.quantity_dispatched - line.quantity_received
+            if outstanding == 0:
+                continue
+            try:
+                quantity = _whole_number(
+                    quantity_map.get(str(line.id), outstanding),
+                    "Received quantity",
+                )
+            except ValueError as exc:
+                return JsonResponse({"detail": str(exc)}, status=400)
+            if quantity == 0:
+                continue
+            if quantity < 0 or quantity > outstanding:
+                return JsonResponse(
+                    {"detail": f"Receipt quantity for {line.product.sku} must be between 1 and {outstanding}."},
+                    status=400,
+                )
             requested_batch = str(batch_map.get(str(line.id), line.source_batch.batch)).strip()
             if not requested_batch:
                 return JsonResponse({"detail": "Destination lot numbers cannot be blank."}, status=400)
-            batch_names.append(requested_batch.casefold())
+            if line.destination_batch_id:
+                if requested_batch.casefold() != line.destination_batch.batch.casefold():
+                    return JsonResponse(
+                        {"detail": "A partially received line must continue using its original destination lot."},
+                        status=409,
+                    )
+            else:
+                batch_names.append(requested_batch.casefold())
+            receipts.append((line, quantity, requested_batch))
+        if not receipts:
+            return JsonResponse({"detail": "All transfer quantities have already been received."}, status=409)
         if len(batch_names) != len(set(batch_names)):
             return JsonResponse({"detail": "Each transfer line needs a unique destination lot number."}, status=409)
         existing_batches = {
@@ -1785,7 +1915,7 @@ def receive_transfer(request, transfer_id):
             return JsonResponse({"detail": f"Batch {next(iter(conflicts))} already exists at destination."}, status=409)
         policy = _branch_policy(branch)
         witness = None
-        if any(line.product.is_controlled for line in lines) and (
+        if any(line.product.is_controlled for line, _, _ in receipts) and (
             policy is None or policy.controlled_witness_required
         ):
             witness, witness_error = _controlled_witness(
@@ -1795,29 +1925,34 @@ def receive_transfer(request, transfer_id):
             )
             if witness_error:
                 return witness_error
-        for line in lines:
-            requested_batch = str(batch_map.get(str(line.id), line.source_batch.batch)).strip()
+        all_received = True
+        for line, quantity, requested_batch in receipts:
             source = line.source_batch
-            batch = MedicineBatch.objects.create(
-                branch=branch,
-                product=line.product,
-                batch=requested_batch,
-                quantity=line.quantity_dispatched,
-                reorder_level=source.reorder_level,
-                expiry=source.expiry,
-                supplier=source.supplier,
-                reference=transfer.reference,
-                purchase_cost=source.purchase_cost,
-                selling_price=source.selling_price,
-            )
-            line.destination_batch = batch
-            line.quantity_received = line.quantity_dispatched
+            if line.destination_batch_id:
+                batch = MedicineBatch.objects.select_for_update().get(pk=line.destination_batch_id)
+                batch.quantity += quantity
+                batch.save(update_fields=["quantity", "updated_at"])
+            else:
+                batch = MedicineBatch.objects.create(
+                    branch=branch,
+                    product=line.product,
+                    batch=requested_batch,
+                    quantity=quantity,
+                    reorder_level=source.reorder_level,
+                    expiry=source.expiry,
+                    supplier=source.supplier,
+                    reference=transfer.reference,
+                    purchase_cost=source.purchase_cost,
+                    selling_price=source.selling_price,
+                )
+                line.destination_batch = batch
+            line.quantity_received += quantity
             line.save(update_fields=["destination_batch", "quantity_received"])
             movement = StockMovement.objects.create(
                 branch=branch,
                 batch=batch,
                 type=StockMovement.Type.TRANSFER_IN,
-                quantity=line.quantity_received,
+                quantity=quantity,
                 reference=transfer.reference,
                 supplier=transfer.source_branch.name,
                 actor=request.user,
@@ -1829,9 +1964,16 @@ def receive_transfer(request, transfer_id):
                     balance_after=batch.quantity,
                     notes=f"Transfer receipt from {transfer.source_branch.code}",
                 )
-        transfer.status = BranchTransfer.Status.RECEIVED
+            if line.quantity_received < line.quantity_dispatched:
+                all_received = False
+        transfer.status = (
+            BranchTransfer.Status.RECEIVED
+            if all_received
+            else BranchTransfer.Status.PARTIALLY_RECEIVED
+        )
         transfer.received_by = request.user
-        transfer.received_at = timezone.now()
+        if all_received:
+            transfer.received_at = timezone.now()
         transfer.save(update_fields=["status", "received_by", "received_at"])
         _record_audit(request, branch, AuditEvent.Action.STOCK_ADJUSTED, "branch_transfer", transfer.pk, {"status": transfer.status}, transfer.reference)
     return JsonResponse({"id": transfer.pk, "status": transfer.status})

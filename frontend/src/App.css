@@ -622,6 +622,29 @@
   padding: 0 20px 16px;
 }
 
+.transfer-line {
+  display: grid;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.transfer-line label {
+  display: inline-grid;
+  grid-template-columns: auto minmax(70px, 110px);
+  align-items: center;
+  gap: 8px;
+  color: #67697c;
+  font-size: 12px;
+}
+
+.transfer-line input {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #e1e2eb;
+  border-radius: 6px;
+  font: inherit;
+}
+
 .checkbox-label {
   display: flex;
   align-items: center;
