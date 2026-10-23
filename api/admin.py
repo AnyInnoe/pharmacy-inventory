@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AuditEvent, Branch, BranchMembership
+from .models import AuditEvent, Branch, BranchMembership, MedicationProduct
 
 
 @admin.register(Branch)
@@ -16,6 +16,21 @@ class BranchMembershipAdmin(admin.ModelAdmin):
     list_filter = ("role", "is_active", "branch")
     search_fields = ("user__username", "user__first_name", "user__last_name")
     autocomplete_fields = ("user", "branch", "assigned_by")
+
+
+@admin.register(MedicationProduct)
+class MedicationProductAdmin(admin.ModelAdmin):
+    list_display = (
+        "sku",
+        "name",
+        "category",
+        "barcode",
+        "requires_prescription",
+        "is_controlled",
+        "is_active",
+    )
+    list_filter = ("category", "requires_prescription", "is_controlled", "is_active")
+    search_fields = ("sku", "name", "barcode")
 
 
 @admin.register(AuditEvent)

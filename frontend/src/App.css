@@ -571,6 +571,23 @@
   font-size: 14px;
 }
 
+.branch-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.branch-select select {
+  max-width: 220px;
+  padding: 8px 10px;
+  border: 1px solid #e1e2eb;
+  border-radius: 7px;
+  background: #fff;
+  color: #26283a;
+  font: inherit;
+}
+
 @media (max-width: 650px) {
   .auth-card {
     padding: 24px;
@@ -585,5 +602,10 @@
     width: 100%;
     justify-content: space-between;
     flex-wrap: wrap;
+  }
+
+  .branch-select {
+    width: 100%;
+    justify-content: space-between;
   }
 }

@@ -1,6 +1,29 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 
+async function apiRequest(path, { method = 'GET', body } = {}) {
+  const headers = {}
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  if (method !== 'GET') {
+    const csrfResponse = await fetch('/api/auth/csrf/', { credentials: 'include' })
+    const csrfData = await csrfResponse.json()
+    if (!csrfResponse.ok) {
+      throw new Error(csrfData.detail || 'Could not prepare a secure request.')
+    }
+    headers['X-CSRFToken'] = csrfData.csrfToken
+  }
+
+  const response = await fetch(path, {
+    method,
+    credentials: 'include',
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const data = await response.json()
+  if (!response.ok) throw new Error(data.detail || 'The request failed.')
+  return data
+}
+
 function LoginScreen({
   username,
   setUsername,
@@ -43,53 +66,6 @@ function LoginScreen({
     </main>
   )
 }
-
-const medicines = [
-  {
-    sku: 'MED-0001',
-    name: 'Paracetamol 500mg',
-    category: 'Pain relief',
-    batch: 'PCM-2408A',
-    quantity: 248,
-    reorderLevel: 30,
-    expiry: '2027-08-18',
-    purchaseCost: 500,
-    sellingPrice: 1000,
-  },
-  {
-    sku: 'MED-0002',
-    name: 'Amoxicillin 250mg',
-    category: 'Antibiotics',
-    batch: 'AMX-2503B',
-    quantity: 18,
-    reorderLevel: 25,
-    expiry: '2027-02-03',
-    purchaseCost: 800,
-    sellingPrice: 1600,
-  },
-  {
-    sku: 'MED-0004',
-    name: 'ORS Sachets',
-    category: 'Rehydration',
-    batch: 'ORS-2412C',
-    quantity: 7,
-    reorderLevel: 10,
-    expiry: '2027-01-12',
-    purchaseCost: 300,
-    sellingPrice: 600,
-  },
-  {
-    sku: 'MED-0006',
-    name: 'Artemether/Lumefantrine',
-    category: 'Antimalarials',
-    batch: 'AL-2403D',
-    quantity: 0,
-    reorderLevel: 20,
-    expiry: '2027-03-08',
-    purchaseCost: 1200,
-    sellingPrice: 2400,
-  },
-]
 
 const emptyBatch = {
   sku: '',
@@ -144,10 +120,7 @@ const emptyCustomerPayment = {
   reference: '',
 }
 
-function getStockStatus(medicine) {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-
+function getStockStatus(medicine, today = new Date()) {
   const expiryDate = new Date(`${medicine.expiry}T00:00:00`)
 
   if (expiryDate < today) return 'Expired'
@@ -178,7 +151,7 @@ function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
-  const [inventory, setInventory] = useState(medicines)
+  const [inventory, setInventory] = useState([])
   const [showAddForm, setShowAddForm] = useState(false)
   const [newBatch, setNewBatch] = useState(emptyBatch)
   const [formError, setFormError] = useState('')
@@ -208,6 +181,84 @@ function App() {
   const [loginUsername, setLoginUsername] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [loginSubmitting, setLoginSubmitting] = useState(false)
+  const [branches, setBranches] = useState([])
+  const [activeBranchId, setActiveBranchId] = useState('')
+  const [loadedBranchId, setLoadedBranchId] = useState('')
+  const [dataError, setDataError] = useState('')
+  const [today] = useState(() => {
+    const currentDate = new Date()
+    currentDate.setHours(0, 0, 0, 0)
+    return currentDate
+  })
+
+  useEffect(() => {
+    if (!currentUser) return
+    let cancelled = false
+
+    apiRequest('/api/branches/')
+      .then(({ branches: availableBranches }) => {
+        if (cancelled) return
+        setBranches(availableBranches)
+        setActiveBranchId((current) => {
+          if (availableBranches.some((branch) => String(branch.id) === String(current))) {
+            return String(current)
+          }
+          const membershipBranch = currentUser.memberships.find((membership) =>
+            availableBranches.some((branch) => branch.id === membership.branchId)
+          )?.branchId
+          return String(membershipBranch ?? availableBranches[0]?.id ?? '')
+        })
+      })
+      .catch((error) => {
+        if (!cancelled) setDataError(error.message || 'Could not load your branches.')
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser])
+
+  useEffect(() => {
+    if (!currentUser || !activeBranchId) return
+    let cancelled = false
+
+    apiRequest(`/api/data/?branchId=${encodeURIComponent(activeBranchId)}`)
+      .then((data) => {
+        if (cancelled) return
+        setInventory(data.inventory)
+        setStockMovements(data.stockMovements)
+        setSales(data.sales)
+        setSupplierInvoices(data.supplierInvoices)
+        setSupplierPayments(data.supplierPayments)
+        setCustomerPayments(data.customerPayments)
+        setDataError('')
+        setLoadedBranchId(activeBranchId)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setDataError(error.message || 'Could not load branch data.')
+          setLoadedBranchId(activeBranchId)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser, activeBranchId])
+
+  async function saveBranchAction(path, values) {
+    await apiRequest(path, {
+      method: 'POST',
+      body: { ...values, branchId: Number(activeBranchId) },
+    })
+    const data = await apiRequest(`/api/data/?branchId=${encodeURIComponent(activeBranchId)}`)
+    setInventory(data.inventory)
+    setStockMovements(data.stockMovements)
+    setSales(data.sales)
+    setSupplierInvoices(data.supplierInvoices)
+    setSupplierPayments(data.supplierPayments)
+    setCustomerPayments(data.customerPayments)
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -316,20 +367,17 @@ function App() {
   ).size
 
   const lowStockCount = inventory.filter(
-    (medicine) => getStockStatus(medicine) === 'Low stock'
+    (medicine) => getStockStatus(medicine, today) === 'Low stock'
   ).length
 
   const outOfStockCount = inventory.filter(
-    (medicine) => getStockStatus(medicine) === 'Out of stock'
+    (medicine) => getStockStatus(medicine, today) === 'Out of stock'
   ).length
 
   const expiredCount = inventory.filter(
     (medicine) =>
-      medicine.quantity > 0 && getStockStatus(medicine) === 'Expired'
+      medicine.quantity > 0 && getStockStatus(medicine, today) === 'Expired'
   ).length
-
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
 
   const expiringSoonCount = inventory.filter((medicine) => {
     const expiryDate = new Date(`${medicine.expiry}T00:00:00`)
@@ -376,7 +424,7 @@ function App() {
       searchTerm.trim().toLowerCase()
     )
     const matchesStatus =
-      statusFilter === 'all' || getStockStatus(medicine) === statusFilter
+      statusFilter === 'all' || getStockStatus(medicine, today) === statusFilter
 
     return matchesSearch && matchesStatus
   })
@@ -396,7 +444,7 @@ function App() {
     setStockCountForm((current) => ({ ...current, [name]: value }))
   }
 
-  function handleAddBatch(event) {
+  async function handleAddBatch(event) {
     event.preventDefault()
 
     const batchNumber = newBatch.batch.trim()
@@ -419,43 +467,29 @@ function App() {
     const supplier = newBatch.supplier.trim()
     const reference = newBatch.reference.trim()
 
-    const receiptRecord = {
-      id: `${batchNumber}-${Date.now()}`,
-      type: 'Received',
-      name,
-      sku,
-      batch: batchNumber,
-      quantity,
-      supplier,
-      recipient: '',
-      reference,
-      recordedAt: new Date().toISOString(),
-    }
-
-    setInventory((current) => [
-      ...current,
-      {
-        ...newBatch,
+    try {
+      await saveBranchAction('/api/batches/', {
         sku,
         name,
         category: newBatch.category.trim(),
         batch: batchNumber,
-        supplier,
-        reference,
         quantity,
         reorderLevel,
+        expiry: newBatch.expiry,
+        supplier,
+        reference,
         purchaseCost,
         sellingPrice,
-      },
-    ])
-
-    setStockMovements((current) => [receiptRecord, ...current])
-    setNewBatch(emptyBatch)
-    setFormError('')
-    setShowAddForm(false)
+      })
+      setNewBatch(emptyBatch)
+      setFormError('')
+      setShowAddForm(false)
+    } catch (error) {
+      setFormError(error.message || 'Could not save this batch.')
+    }
   }
 
-  function handleDispense(event) {
+  async function handleDispense(event) {
     event.preventDefault()
 
     const quantity = Number(dispenseForm.quantity)
@@ -515,16 +549,6 @@ function App() {
           )
         : 0
 
-    const costAmount =
-      transactionType === 'Sale'
-        ? allocations.reduce(
-            (total, allocation) =>
-              total +
-              allocation.quantity * Number(allocation.batch.purchaseCost || 0),
-            0
-          )
-        : 0
-
     if (
       transactionType === 'Sale' &&
       (!paymentMethod ||
@@ -538,57 +562,22 @@ function App() {
       return
     }
 
-    setInventory((current) =>
-      current.map((item) => {
-        const allocation = allocations.find(
-          (entry) => entry.batch.batch === item.batch
-        )
-
-        return allocation
-          ? { ...item, quantity: item.quantity - allocation.quantity }
-          : item
+    try {
+      await saveBranchAction('/api/dispense/', {
+        sku: dispenseForm.sku,
+        transactionType,
+        quantity,
+        recipient,
+        reference,
+        amountReceived,
+        paymentMethod,
       })
-    )
-
-    const recordedAt = new Date().toISOString()
-    const movements = allocations.map((allocation, index) => ({
-      id: `${allocation.batch.batch}-${Date.now()}-${index}`,
-      type: transactionType,
-      name: allocation.batch.name,
-      sku: allocation.batch.sku,
-      batch: allocation.batch.batch,
-      quantity: -allocation.quantity,
-      supplier: '',
-      recipient,
-      reference,
-      recordedAt,
-    }))
-
-    setStockMovements((current) => [...movements, ...current])
-    if (transactionType === 'Sale') {
-      setSales((current) => [
-        {
-          id: `SALE-${Date.now()}`,
-          sku: dispenseForm.sku,
-          name: allocations[0]?.batch.name || '',
-          quantity,
-          saleAmount,
-          costAmount,
-          grossProfit: saleAmount - costAmount,
-          amountReceived,
-          balanceDue: saleAmount - amountReceived,
-          paymentMethod,
-          recipient,
-          reference,
-          recordedAt,
-        },
-        ...current,
-      ])
+      setDispenseForm(emptyDispense)
+      setDispenseError('')
+      setShowDispenseForm(false)
+    } catch (error) {
+      setDispenseError(error.message || 'Could not record this dispensing.')
     }
-
-    setDispenseForm(emptyDispense)
-    setDispenseError('')
-    setShowDispenseForm(false)
   }
 
 
@@ -603,7 +592,7 @@ function App() {
     setSupplierPaymentForm((current) => ({ ...current, [name]: value }))
   }
 
-  function handleSaveSupplierInvoice(event) {
+  async function handleSaveSupplierInvoice(event) {
     event.preventDefault()
 
     const supplier = supplierInvoiceForm.supplier.trim()
@@ -630,37 +619,24 @@ function App() {
       return
     }
 
-    const invoice = {
-      id: `INV-${Date.now()}`,
-      supplier,
-      invoiceNumber,
-      invoiceAmount,
-      amountPaid,
-      dueDate: supplierInvoiceForm.dueDate,
-      createdAt: new Date().toISOString(),
-    }
-
-    setSupplierInvoices((current) => [invoice, ...current])
-
-    if (amountPaid > 0) {
-      setSupplierPayments((current) => [{
-        id: `PAY-${Date.now()}`,
-        invoiceId: invoice.id,
+    try {
+      await saveBranchAction('/api/supplier-invoices/', {
         supplier,
         invoiceNumber,
-        amount: amountPaid,
+        invoiceAmount,
+        amountPaid,
+        dueDate: supplierInvoiceForm.dueDate,
         method: 'Opening payment',
-        reference: invoiceNumber,
-        recordedAt: invoice.createdAt,
-      }, ...current])
+      })
+      setSupplierInvoiceForm(emptySupplierInvoice)
+      setSupplierInvoiceError('')
+      setShowSupplierInvoiceForm(false)
+    } catch (error) {
+      setSupplierInvoiceError(error.message || 'Could not save the supplier invoice.')
     }
-
-    setSupplierInvoiceForm(emptySupplierInvoice)
-    setSupplierInvoiceError('')
-    setShowSupplierInvoiceForm(false)
   }
 
-  function handleRecordSupplierPayment(event) {
+  async function handleRecordSupplierPayment(event) {
     event.preventDefault()
 
     const amount = Number(supplierPaymentForm.amount)
@@ -678,24 +654,18 @@ function App() {
       return
     }
 
-    const recordedAt = new Date().toISOString()
-    setSupplierInvoices((current) => current.map((item) =>
-      item.id === invoice.id ? { ...item, amountPaid: item.amountPaid + amount } : item
-    ))
-    setSupplierPayments((current) => [{
-      id: `PAY-${Date.now()}`,
-      invoiceId: invoice.id,
-      supplier: invoice.supplier,
-      invoiceNumber: invoice.invoiceNumber,
-      amount,
-      method: supplierPaymentForm.method,
-      reference,
-      recordedAt,
-    }, ...current])
-
-    setSupplierPaymentForm(emptySupplierPayment)
-    setSupplierPaymentError('')
-    setShowSupplierPaymentForm(false)
+    try {
+      await saveBranchAction(`/api/supplier-invoices/${invoice.id}/payments/`, {
+        amount,
+        method: supplierPaymentForm.method,
+        reference,
+      })
+      setSupplierPaymentForm(emptySupplierPayment)
+      setSupplierPaymentError('')
+      setShowSupplierPaymentForm(false)
+    } catch (error) {
+      setSupplierPaymentError(error.message || 'Could not record the supplier payment.')
+    }
   }
 
   function handleCustomerPaymentChange(event) {
@@ -703,7 +673,7 @@ function App() {
     setCustomerPaymentForm((current) => ({ ...current, [name]: value }))
   }
 
-  function handleRecordCustomerPayment(event) {
+  async function handleRecordCustomerPayment(event) {
     event.preventDefault()
 
     const sale = sales.find((item) => item.id === customerPaymentForm.saleId)
@@ -721,33 +691,21 @@ function App() {
       return
     }
 
-    const recordedAt = new Date().toISOString()
-    const newAmountReceived = Number((sale.amountReceived + amount).toFixed(2))
-    const newBalanceDue = Number((sale.balanceDue - amount).toFixed(2))
-
-    setSales((current) => current.map((item) =>
-      item.id === sale.id
-        ? { ...item, amountReceived: newAmountReceived, balanceDue: newBalanceDue }
-        : item
-    ))
-
-    setCustomerPayments((current) => [{
-      id: `CUST-PAY-${Date.now()}`,
-      saleId: sale.id,
-      saleReference: sale.reference,
-      customer: sale.recipient,
-      amount,
-      method,
-      reference,
-      recordedAt,
-    }, ...current])
-
-    setCustomerPaymentForm(emptyCustomerPayment)
-    setCustomerPaymentError('')
-    setShowCustomerPaymentForm(false)
+    try {
+      await saveBranchAction(`/api/sales/${sale.id}/payments/`, {
+        amount,
+        method,
+        reference,
+      })
+      setCustomerPaymentForm(emptyCustomerPayment)
+      setCustomerPaymentError('')
+      setShowCustomerPaymentForm(false)
+    } catch (error) {
+      setCustomerPaymentError(error.message || 'Could not record the customer payment.')
+    }
   }
 
-  function handleStockCount(event) {
+  async function handleStockCount(event) {
     event.preventDefault()
 
     const countedQuantity = Number(stockCountForm.quantity)
@@ -785,33 +743,19 @@ function App() {
       return
     }
 
-    setInventory((current) =>
-      current.map((item) =>
-        item.batch === countedBatch.batch
-          ? { ...item, quantity: countedQuantity }
-          : item
-      )
-    )
-
-    setStockMovements((current) => [
-      {
-        id: `${countedBatch.batch}-count-${Date.now()}`,
-        type: 'Stock count adjustment',
-        name: countedBatch.name,
-        sku: countedBatch.sku,
+    try {
+      await saveBranchAction('/api/stock-count/', {
         batch: countedBatch.batch,
-        quantity: difference,
-        supplier: '',
-        recipient: reason,
+        quantity: countedQuantity,
+        reason,
         reference,
-        recordedAt: new Date().toISOString(),
-      },
-      ...current,
-    ])
-
-    setStockCountForm(emptyStockCount)
-    setStockCountError('')
-    setShowStockCountForm(false)
+      })
+      setStockCountForm(emptyStockCount)
+      setStockCountError('')
+      setShowStockCountForm(false)
+    } catch (error) {
+      setStockCountError(error.message || 'Could not save the stock count.')
+    }
   }
 
   const navPages = ['Overview', 'Inventory', 'Suppliers', 'Reports']
@@ -874,6 +818,25 @@ function App() {
             {activePage === 'Overview' ? 'Pharmacy Inventory' : activePage}
           </h1>
           <div className="topbar-actions">
+            {branches.length > 0 && (
+              <label className="branch-select">
+                Branch
+                <select
+                  value={activeBranchId}
+                  onChange={(event) => {
+                    setDataError('')
+                    setActiveBranchId(event.target.value)
+                  }}
+                  aria-label="Active branch"
+                >
+                  {branches.map((branch) => (
+                    <option key={branch.id} value={branch.id}>
+                      {branch.code} — {branch.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <span>
               Signed in as {currentUser.firstName || currentUser.username}
             </span>
@@ -885,6 +848,15 @@ function App() {
         </header>
 
         <section className="dashboard">
+          {dataError && <p className="form-error" role="alert">{dataError}</p>}
+          {!dataError && branches.length === 0 && (
+            <p className="form-error" role="alert">
+              No active branch is assigned to your account. Ask an administrator to assign one.
+            </p>
+          )}
+          {currentUser && activeBranchId && loadedBranchId !== activeBranchId && (
+            <p role="status">Loading branch data…</p>
+          )}
           {activePage === 'Overview' && (
             <>
               <h2>Good morning</h2>
@@ -1343,7 +1315,7 @@ function App() {
 
                 <tbody>
                   {filteredMedicines.map((medicine) => {
-                    const status = getStockStatus(medicine)
+                    const status = getStockStatus(medicine, today)
                     const statusClass = {
                       'In stock': 'in-stock',
                       'Low stock': 'low-stock',
@@ -1647,5 +1619,3 @@ function App() {
 }
 
 export default App
-
-
