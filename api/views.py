@@ -630,9 +630,11 @@ def dispense_stock(request):
     if product.requires_prescription or product.is_controlled:
         return JsonResponse(
             {
+                "code": "prescription_required",
                 "detail": (
-                    "This medicine requires the prescription or controlled-medicine "
-                    "workflow, which is not available yet."
+                    "This medicine cannot be dispensed through regular sales. Record and "
+                    "verify its prescription in the Prescriptions workflow; controlled "
+                    "medicines also require an independent witness."
                 )
             },
             status=400,

@@ -267,6 +267,8 @@ class InventoryApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "prescription_required")
+        self.assertIn("Prescriptions workflow", response.json()["detail"])
         self.assertEqual(MedicineBatch.objects.get().quantity, 10)
         self.assertEqual(Sale.objects.count(), 0)
         self.assertEqual(StockMovement.objects.count(), 1)

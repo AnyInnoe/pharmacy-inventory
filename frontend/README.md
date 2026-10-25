@@ -8,7 +8,7 @@ React and Vite dashboard for the Django pharmacy inventory API.
 
    ```powershell
    .\.venv314\Scripts\python.exe .\backend\manage.py migrate
-   .\.venv314\Scripts\python.exe .\backend\manage.py runserver 127.0.0.1:8001
+   .\.venv314\Scripts\python.exe .\backend\manage.py runserver 127.0.0.1:8000
    ```
 
 2. Create a Django administrator and at least one active branch. Assign the
@@ -22,7 +22,7 @@ React and Vite dashboard for the Django pharmacy inventory API.
    npm.cmd run dev
    ```
 
-   Vite proxies `/api` requests to `http://127.0.0.1:8001`.
+   Vite proxies `/api` requests to `http://127.0.0.1:8000`.
 
 ## Validation
 
@@ -30,11 +30,13 @@ Run `npm.cmd run lint` and `npm.cmd run build` from this directory. Run backend
 tests from the repository root with
 `.\.venv314\Scripts\python.exe .\backend\manage.py test`.
 
-## Production note
+## Production deployment
 
-The Django settings currently use development defaults. Before deployment,
-configure secrets, `DEBUG`, allowed hosts, HTTPS/secure cookies, database
-backups, static files, logging, and environment-specific CSRF trusted origins.
+See [the PostgreSQL deployment guide](../docs/POSTGRESQL-DEPLOYMENT.md) for
+backend dependency installation, PostgreSQL configuration, production security
+settings, migrations, static files, and operational requirements. The Django
+development server is for local use only.
+
 See [the project wireframe](../docs/PROJECT-WIREFRAME.md) for the implemented
 internal workflows, jurisdiction and integration boundaries, and remaining
 release limitations.

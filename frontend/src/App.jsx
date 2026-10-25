@@ -20,7 +20,11 @@ async function apiRequest(path, { method = 'GET', body } = {}) {
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const data = await response.json()
-  if (!response.ok) throw new Error(data.detail || 'The request failed.')
+  if (!response.ok) {
+    const error = new Error(data.detail || 'The request failed.')
+    error.code = data.code
+    throw error
+  }
   return data
 }
 
@@ -232,6 +236,7 @@ function App() {
   const [showDispenseForm, setShowDispenseForm] = useState(false)
   const [dispenseForm, setDispenseForm] = useState(emptyDispense)
   const [dispenseError, setDispenseError] = useState('')
+  const [prescriptionRedirectSku, setPrescriptionRedirectSku] = useState('')
   const [showStockCountForm, setShowStockCountForm] = useState(false)
   const [stockCountForm, setStockCountForm] = useState(emptyStockCount)
   const [stockCountError, setStockCountError] = useState('')
@@ -720,8 +725,12 @@ function App() {
       })
       setDispenseForm(emptyDispense)
       setDispenseError('')
+      setPrescriptionRedirectSku('')
       setShowDispenseForm(false)
     } catch (error) {
+      setPrescriptionRedirectSku(
+        error.code === 'prescription_required' ? dispenseForm.sku : ''
+      )
       setDispenseError(error.message || 'Could not record this dispensing.')
     }
   }
@@ -1687,7 +1696,27 @@ function App() {
                     </>
                   )}
                   {dispenseError && (
-                    <p className="form-error">{dispenseError}</p>
+                    <div className="form-error" role="alert">
+                      <p>{dispenseError}</p>
+                      {prescriptionRedirectSku && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPrescriptionForm((current) => ({
+                              ...current,
+                              sku: prescriptionRedirectSku,
+                            }))
+                            setPrescriptionRedirectSku('')
+                            setDispenseError('')
+                            setShowDispenseForm(false)
+                            setWorkflowError('')
+                            setActivePage('Prescriptions')
+                          }}
+                        >
+                          Record prescription for this medicine
+                        </button>
+                      )}
+                    </div>
                   )}
 
                   <button type="submit">Record dispensing</button>

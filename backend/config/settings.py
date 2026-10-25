@@ -11,8 +11,9 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
-import sys
+from urllib.parse import parse_qs, unquote, urlparse
 import os
+import sys
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,21 +21,43 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BASE_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
+def _env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value.")
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'PHARMACY_DJANGO_SECRET_KEY'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+def _env_list(name, default=()):
+    value = os.environ.get(name)
+    if value is None:
+        return list(default)
+    return [item.strip() for item in value.split(",") if item.strip()]
 
-ALLOWED_HOSTS = []
 
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+DEBUG = _env_bool("DJANGO_DEBUG", True)
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise RuntimeError("DJANGO_SECRET_KEY must be configured when DJANGO_DEBUG is false.")
+    SECRET_KEY = "django-insecure-local-development-only"
+
+ALLOWED_HOSTS = _env_list(
+    "DJANGO_ALLOWED_HOSTS",
+    ("localhost", "127.0.0.1", "[::1]") if DEBUG else (),
+)
+if not DEBUG and (not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS):
+    raise RuntimeError("Set DJANGO_ALLOWED_HOSTS to explicit hostnames in production.")
+
+CSRF_TRUSTED_ORIGINS = _env_list(
+    "DJANGO_CSRF_TRUSTED_ORIGINS",
+    ("http://localhost:5173", "http://127.0.0.1:5173") if DEBUG else (),
+)
 
 # Application definition
 
@@ -50,6 +73,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -78,15 +102,70 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 
-# Database
-# https://docs.djangoproject.com/en/6.1/ref/settings/#databases
+def _postgres_database(url=None):
+    if url:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"postgres", "postgresql"}:
+            raise ValueError("DATABASE_URL must use the postgres:// or postgresql:// scheme.")
+        if not parsed.hostname or not parsed.path.strip("/"):
+            raise ValueError("DATABASE_URL must include a database name and hostname.")
+        options = {
+            key: values[-1]
+            for key, values in parse_qs(parsed.query).items()
+        }
+        name = unquote(parsed.path.lstrip("/"))
+        user = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        host = parsed.hostname
+        port = str(parsed.port) if parsed.port else os.environ.get("DB_PORT", "5432")
+    else:
+        name = os.environ.get("DB_NAME", "")
+        user = os.environ.get("DB_USER", "")
+        password = os.environ.get("DB_PASSWORD", "")
+        host = os.environ.get("DB_HOST", "")
+        port = os.environ.get("DB_PORT", "5432")
+        options = {}
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    if not name:
+        raise RuntimeError("Set DATABASE_URL or DB_NAME to configure PostgreSQL.")
+
+    sslmode = os.environ.get("DB_SSLMODE")
+    if sslmode:
+        options["sslmode"] = sslmode
+    elif not DEBUG:
+        options.setdefault("sslmode", "require")
+
+    connect_timeout = os.environ.get("DB_CONNECT_TIMEOUT", "10")
+    if connect_timeout:
+        options["connect_timeout"] = connect_timeout
+
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": name,
+        "USER": user,
+        "PASSWORD": password,
+        "HOST": host,
+        "PORT": port,
+        "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "60")),
+        "CONN_HEALTH_CHECKS": True,
+        "OPTIONS": options,
     }
-}
+
+
+database_url = os.environ.get("DATABASE_URL")
+if database_url or os.environ.get("DB_NAME"):
+    DATABASES = {"default": _postgres_database(database_url)}
+elif DEBUG:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+else:
+    raise RuntimeError(
+        "Configure DATABASE_URL (or DB_NAME and related DB_* variables) in production."
+    )
 
 
 # Password validation
@@ -124,13 +203,56 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
+if not DEBUG:
+    SECURE_SSL_REDIRECT = _env_bool("DJANGO_SECURE_SSL_REDIRECT", True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = _env_bool(
+        "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", False
+    )
+    SECURE_HSTS_PRELOAD = _env_bool("DJANGO_SECURE_HSTS_PRELOAD", False)
+    if _env_bool("DJANGO_TRUST_PROXY_SSL_HEADER", False):
+        SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
+email_backend = (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if not DEBUG
+    else "django.core.mail.backends.console.EmailBackend"
+)
+
+email_options = {}
+if email_backend == "django.core.mail.backends.smtp.EmailBackend":
+    email_options = {
+        "host": os.environ.get("EMAIL_HOST", ""),
+        "port": int(os.environ.get("EMAIL_PORT", "587")),
+        "username": os.environ.get("EMAIL_HOST_USER", ""),
+        "password": os.environ.get("EMAIL_HOST_PASSWORD", ""),
+        "use_tls": _env_bool("EMAIL_USE_TLS", not DEBUG),
+        "use_ssl": _env_bool("EMAIL_USE_SSL", False),
+        "timeout": int(os.environ.get("EMAIL_TIMEOUT", "10")),
+    }
+    if email_options["use_tls"] and email_options["use_ssl"]:
+        raise ValueError("EMAIL_USE_TLS and EMAIL_USE_SSL cannot both be enabled.")
+
 MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+    "default": {
+        "BACKEND": email_backend,
+        "OPTIONS": email_options,
     },
 }
