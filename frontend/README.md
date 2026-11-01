@@ -13,6 +13,10 @@ React and Vite dashboard for the Django pharmacy inventory API.
 
 2. Create a Django administrator and at least one active branch. Assign the
    user an active branch membership in Django admin, or sign in as a superuser.
+   Branch memberships support cashier, pharmacist, and branch-manager roles.
+   Cashier sales stay pending until a pharmacist or branch manager approves
+   them; approval records payment and reduces stock. Assign users only the
+   branch roles and permissions they need.
 
 3. In another terminal:
 

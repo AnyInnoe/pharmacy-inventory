@@ -6,11 +6,14 @@ A branch-aware pharmacy operations system that keeps medication catalog, lot-lev
 
 ## Users and access
 
-- **Pharmacist:** look up products, receive stock, dispense sales or non-sale issues, and record stock counts for assigned branches.
+- **Cashier:** look up branch products and prices, submit a checkout, and record payments against approved sales. Every cashier checkout remains pending until a pharmacist or branch manager approves it; stock and payments are not posted before approval. Cashiers cannot approve their own checkouts, dispense prescriptions, adjust stock, or access cost and margin data.
+- **Pharmacist:** verify prescriptions, authorize and dispense prescription medicines, review or reject pending sales, receive stock, record stock counts, and process permitted sales or non-sale issues for assigned branches.
 - **Branch manager:** pharmacist workflows plus supplier invoices/payments, branch reports, and staff oversight.
 - **Administrator:** manage branches, memberships, product catalog, controlled-medicine settings, and system configuration.
 
 Every operational record belongs to a branch. Users may only read or change records in branches where they have an active membership; administrators can select any active branch.
+
+Cashier checkout is a two-step workflow: the cashier submits the sale and proposed payment details; a pharmacist or branch manager reviews and approves or rejects it. Approval rechecks current unexpired stock and prices under transaction locks. If stock or price changed since submission, approval fails and the cashier must submit a corrected checkout. Only approval records payment, decrements stock, writes stock movements, and queues the POS event. The sale records both the submitting user and approving user for audit.
 
 ## Navigation map
 

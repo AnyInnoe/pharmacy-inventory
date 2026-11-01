@@ -218,6 +218,8 @@ function getSupplierInvoiceStatus(invoice) {
 }
 
 function getSalePaymentStatus(sale) {
+  if (sale.approvalStatus === 'pending') return 'Awaiting pharmacist approval'
+  if (sale.approvalStatus === 'rejected') return 'Rejected'
   if (sale.balanceDue <= 0) return 'Paid'
   if (sale.amountReceived > 0) return 'Partially paid'
   return 'Unpaid'
@@ -272,6 +274,8 @@ function App() {
   const [transfers, setTransfers] = useState([])
   const [analytics, setAnalytics] = useState(null)
   const [workflowError, setWorkflowError] = useState('')
+  const [workflowNotice, setWorkflowNotice] = useState('')
+  const [saleRejectionReasons, setSaleRejectionReasons] = useState({})
   const [barcodeInput, setBarcodeInput] = useState('')
   const [prescriptionForm, setPrescriptionForm] = useState(emptyPrescription)
   const [prescriptionDispenseForm, setPrescriptionDispenseForm] = useState(emptyPrescriptionDispense)
@@ -358,16 +362,21 @@ function App() {
   async function refreshBranchData(branchId = activeBranchId, isCurrent = () => true) {
     if (!branchId) return
     const query = `?branchId=${encodeURIComponent(branchId)}`
+    const membership = currentUser?.memberships.find(
+      (item) => String(item.branchId) === String(branchId),
+    )
+    const canReviewClinicalWork = ['pharmacist', 'branch_manager'].includes(membership?.role)
+    const canManageBranch = currentUser?.isSuperuser || membership?.role === 'branch_manager'
     const [data, productData, supplierData, staffData, prescriptionData, orderData, transferData, reorderData] =
       await Promise.all([
         apiRequest(`/api/data/${query}`),
         apiRequest('/api/products/'),
-        apiRequest('/api/suppliers/'),
-        apiRequest(`/api/branch-staff/${query}`),
-        apiRequest(`/api/prescriptions/${query}`),
-        apiRequest(`/api/purchase-orders/${query}`),
-        apiRequest(`/api/transfers/${query}`),
-        apiRequest(`/api/reorder-suggestions/${query}`),
+        canManageBranch ? apiRequest('/api/suppliers/') : Promise.resolve({ suppliers: [] }),
+        canManageBranch ? apiRequest(`/api/branch-staff/${query}`) : Promise.resolve({ members: [] }),
+        canReviewClinicalWork ? apiRequest(`/api/prescriptions/${query}`) : Promise.resolve({ prescriptions: [] }),
+        canReviewClinicalWork ? apiRequest(`/api/purchase-orders/${query}`) : Promise.resolve({ purchaseOrders: [] }),
+        canManageBranch ? apiRequest(`/api/transfers/${query}`) : Promise.resolve({ transfers: [] }),
+        canReviewClinicalWork ? apiRequest(`/api/reorder-suggestions/${query}`) : Promise.resolve({ suggestions: [] }),
       ])
     if (isCurrent()) {
       setInventory(data.inventory)
@@ -578,6 +587,13 @@ function App() {
         String(membership.branchId) === String(activeBranchId) &&
         membership.role === 'branch_manager',
     )
+  const activeRole = currentUser?.isSuperuser
+    ? 'administrator'
+    : currentUser?.memberships.find(
+        (membership) => String(membership.branchId) === String(activeBranchId),
+      )?.role
+  const isCashier = activeRole === 'cashier'
+  const canClinical = ['pharmacist', 'branch_manager'].includes(activeRole)
 
   function handleFormChange(event) {
     const { name, value } = event.target
@@ -727,6 +743,11 @@ function App() {
       setDispenseError('')
       setPrescriptionRedirectSku('')
       setShowDispenseForm(false)
+      setWorkflowNotice(
+        transactionType === 'Sale' && !canClinical
+          ? 'Sale submitted. A pharmacist must approve it before stock is deducted or payment is recorded.'
+          : '',
+      )
     } catch (error) {
       setPrescriptionRedirectSku(
         error.code === 'prescription_required' ? dispenseForm.sku : ''
@@ -867,6 +888,34 @@ function App() {
       setShowCustomerPaymentForm(false)
     } catch (error) {
       setCustomerPaymentError(error.message || 'Could not record the customer payment.')
+    }
+  }
+
+  async function handleApproveSale(saleId) {
+    setWorkflowError('')
+    setWorkflowNotice('')
+    try {
+      await saveBranchAction(`/api/sales/${saleId}/approve/`, {})
+      setWorkflowNotice('Sale approved, stock deducted, and payment recorded.')
+    } catch (error) {
+      setWorkflowError(error.message || 'Could not approve this sale.')
+    }
+  }
+
+  async function handleRejectSale(saleId) {
+    const reason = (saleRejectionReasons[saleId] || '').trim()
+    if (!reason) {
+      setWorkflowError('Enter a reason before rejecting a sale.')
+      return
+    }
+    setWorkflowError('')
+    setWorkflowNotice('')
+    try {
+      await saveBranchAction(`/api/sales/${saleId}/reject/`, { reason })
+      setSaleRejectionReasons((current) => ({ ...current, [saleId]: '' }))
+      setWorkflowNotice('Sale rejected. No stock or payment was recorded.')
+    } catch (error) {
+      setWorkflowError(error.message || 'Could not reject this sale.')
     }
   }
 
@@ -1208,12 +1257,9 @@ function App() {
   const navPages = [
     'Overview',
     'Inventory',
-    'Prescriptions',
-    'Purchasing',
-    'Suppliers',
-    'Transfers',
-    'Reports',
-    ...(currentUser?.isStaff ? ['Administration'] : []),
+    ...(canClinical ? ['Prescriptions'] : []),
+    ...(canManageBranch ? ['Purchasing', 'Suppliers', 'Transfers', 'Reports'] : []),
+    ...(currentUser?.isStaff && !isCashier ? ['Administration'] : []),
   ]
 
   if (authLoading) {
@@ -1281,7 +1327,23 @@ function App() {
                   value={activeBranchId}
                   onChange={(event) => {
                     setDataError('')
-                    setActiveBranchId(event.target.value)
+                    const nextBranchId = event.target.value
+                    const nextRole = currentUser.isSuperuser
+                      ? 'administrator'
+                      : currentUser.memberships.find(
+                          (membership) => String(membership.branchId) === String(nextBranchId),
+                        )?.role
+                    const nextCanClinical = ['pharmacist', 'branch_manager'].includes(nextRole)
+                    const nextCanManageBranch = currentUser.isSuperuser || nextRole === 'branch_manager'
+                    const managerOnlyPages = ['Purchasing', 'Suppliers', 'Transfers', 'Reports']
+                    if (
+                      (nextRole === 'cashier' && !['Overview', 'Inventory'].includes(activePage)) ||
+                      (!nextCanClinical && activePage === 'Prescriptions') ||
+                      (!nextCanManageBranch && managerOnlyPages.includes(activePage))
+                    ) {
+                      setActivePage('Overview')
+                    }
+                    setActiveBranchId(nextBranchId)
                   }}
                   aria-label="Active branch"
                 >
@@ -1305,6 +1367,8 @@ function App() {
 
         <section className="dashboard">
           {dataError && <p className="form-error" role="alert">{dataError}</p>}
+          {workflowError && <p className="form-error" role="alert">{workflowError}</p>}
+          {workflowNotice && <p role="status">{workflowNotice}</p>}
           {!dataError && branches.length === 0 && (
             <p className="form-error" role="alert">
               No active branch is assigned to your account. Ask an administrator to assign one.
@@ -1430,29 +1494,29 @@ function App() {
                   <button type="submit">Find</button>
                 </form>
 
-                <button
+                {canClinical && <button
                   type="button"
                   onClick={() => setShowAddForm((shown) => !shown)}
                 >
                   {showAddForm ? 'Close add form' : 'Add batch'}
-                </button>
+                </button>}
 
                 <button
                   type="button"
                   onClick={() => setShowDispenseForm((shown) => !shown)}
                 >
-                  {showDispenseForm ? 'Close dispense form' : 'Dispense stock'}
+                  {showDispenseForm ? 'Close checkout form' : isCashier ? 'New checkout' : 'Dispense stock'}
                 </button>
 
-                <button
+                {canClinical && <button
                   type="button"
                   onClick={() => setShowStockCountForm((shown) => !shown)}
                 >
                   {showStockCountForm ? 'Close stock count' : 'Stock count'}
-                </button>
+                </button>}
               </div>
 
-              {showAddForm && (
+              {showAddForm && canClinical && (
                 <form className="batch-form" onSubmit={handleAddBatch}>
                   <label>
                     SKU
@@ -1624,7 +1688,7 @@ function App() {
                       required
                     >
                       <option value="Sale">Sale</option>
-                      <option value="Non-sale issue">Non-sale issue</option>
+                      {canClinical && <option value="Non-sale issue">Non-sale issue</option>}
                     </select>
                   </label>
 
@@ -1664,6 +1728,7 @@ function App() {
 
                   {dispenseForm.transactionType === 'Sale' && (
                     <>
+                      {isCashier && <p role="note">Payment and stock changes are held until a pharmacist approves this checkout.</p>}
                       <label>
                         Amount received
                         <input
@@ -1719,11 +1784,13 @@ function App() {
                     </div>
                   )}
 
-                  <button type="submit">Record dispensing</button>
+                  <button type="submit">
+                    {isCashier ? 'Submit for pharmacist approval' : 'Record dispensing'}
+                  </button>
                 </form>
               )}
 
-              {showStockCountForm && (
+              {showStockCountForm && canClinical && (
                 <form className="batch-form" onSubmit={handleStockCount}>
                   <label>
                     Batch to count
@@ -1811,9 +1878,9 @@ function App() {
                     <th>Batch</th>
                     <th>Category</th>
                     <th>Quantity</th>
-                    <th>Purchase cost / unit</th>
+                    {canClinical && <th>Purchase cost / unit</th>}
                     <th>Selling price / unit</th>
-                    <th>Gross profit / unit</th>
+                    {canClinical && <th>Gross profit / unit</th>}
                     <th>Expiry date</th>
                     <th>Status</th>
                   </tr>
@@ -1836,9 +1903,9 @@ function App() {
                         <td>{medicine.batch}</td>
                         <td>{medicine.category}</td>
                         <td>{medicine.quantity}</td>
-                        <td>{Number(medicine.purchaseCost || 0).toLocaleString()}</td>
+                        {canClinical && <td>{Number(medicine.purchaseCost || 0).toLocaleString()}</td>}
                         <td>{Number(medicine.sellingPrice || 0).toLocaleString()}</td>
-                        <td>{(Number(medicine.sellingPrice || 0) - Number(medicine.purchaseCost || 0)).toLocaleString()}</td>
+                        {canClinical && <td>{(Number(medicine.sellingPrice || 0) - Number(medicine.purchaseCost || 0)).toLocaleString()}</td>}
                         <td>{medicine.expiry}</td>
                         <td>
                           <span className={`stock-status ${statusClass}`}>
@@ -1851,7 +1918,7 @@ function App() {
 
                   {filteredMedicines.length === 0 && (
                     <tr>
-                      <td colSpan="10">No matching batches found.</td>
+                      <td colSpan={canClinical ? 10 : 8}>No matching batches found.</td>
                     </tr>
                   )}
                 </tbody>
@@ -2285,7 +2352,7 @@ function App() {
                     <label>Outstanding sale
                       <select name="saleId" value={customerPaymentForm.saleId} onChange={handleCustomerPaymentChange} required>
                         <option value="">Select a sale with a balance</option>
-                        {sales.filter((sale) => sale.balanceDue > 0).map((sale) => (
+                        {sales.filter((sale) => sale.approvalStatus === 'approved' && sale.balanceDue > 0).map((sale) => (
                           <option key={sale.id} value={sale.id}>
                             {sale.recipient} — {sale.name} — {sale.reference} — due {sale.balanceDue.toLocaleString()}
                           </option>
@@ -2319,12 +2386,16 @@ function App() {
                       <th>Medicine</th>
                       <th>Quantity</th>
                       <th>Sale total</th>
-                      <th>Gross profit</th>
+                      {canClinical && <th>Gross profit</th>}
                       <th>Received</th>
                       <th>Balance due</th>
+                      <th>Approval</th>
+                      <th>Submitted by</th>
+                      <th>Approved by</th>
                       <th>Payment status</th>
                       <th>Original payment method</th>
                       <th>Reference</th>
+                      <th>Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2334,17 +2405,33 @@ function App() {
                         <td>{sale.name}</td>
                         <td>{sale.quantity}</td>
                         <td>{sale.saleAmount.toLocaleString()}</td>
-                        <td>{sale.grossProfit.toLocaleString()}</td>
+                        {canClinical && <td>{sale.grossProfit.toLocaleString()}</td>}
                         <td>{sale.amountReceived.toLocaleString()}</td>
                         <td>{sale.balanceDue.toLocaleString()}</td>
+                        <td>{sale.approvalStatus}</td>
+                        <td>{sale.submittedBy}</td>
+                        <td>{sale.approvedBy || '—'}</td>
                         <td>{getSalePaymentStatus(sale)}</td>
-                        <td>{sale.paymentMethod}</td>
+                        <td>{sale.paymentMethod || sale.proposedPaymentMethod}</td>
                         <td>{sale.reference}</td>
+                        <td>
+                          {canClinical && sale.approvalStatus === 'pending' && <>
+                            <button type="button" onClick={() => handleApproveSale(sale.id)}>Approve</button>
+                            <label>
+                              Rejection reason
+                              <input
+                                value={saleRejectionReasons[sale.id] || ''}
+                                onChange={(event) => setSaleRejectionReasons((current) => ({ ...current, [sale.id]: event.target.value }))}
+                              />
+                            </label>
+                            <button type="button" onClick={() => handleRejectSale(sale.id)}>Reject</button>
+                          </>}
+                        </td>
                       </tr>
                     ))}
                     {sales.length === 0 && (
                       <tr>
-                        <td colSpan="10">No sales recorded yet.</td>
+                        <td colSpan={canClinical ? 14 : 13}>No sales recorded yet.</td>
                       </tr>
                     )}
                   </tbody>

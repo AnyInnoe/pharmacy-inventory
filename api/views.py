@@ -128,6 +128,49 @@ def _require_roles(request, branch, roles):
     return None
 
 
+def _require_pharmacist(request, branch):
+    role = BranchMembership.objects.filter(
+        user=request.user,
+        branch=branch,
+        is_active=True,
+    ).values_list("role", flat=True).first()
+    if role not in {
+        BranchMembership.Role.PHARMACIST,
+        BranchMembership.Role.BRANCH_MANAGER,
+    }:
+        return JsonResponse(
+            {"detail": "An active pharmacist or branch-manager membership is required."},
+            status=403,
+        )
+    return None
+
+
+def _branch_role_for_user(request, branch):
+    if request.user.is_superuser:
+        return "administrator"
+    return BranchMembership.objects.filter(
+        user=request.user,
+        branch=branch,
+        is_active=True,
+    ).values_list("role", flat=True).first()
+
+
+def _require_catalog_admin(request):
+    has_cashier_membership = BranchMembership.objects.filter(
+        user=request.user,
+        is_active=True,
+        role=BranchMembership.Role.CASHIER,
+    ).exists()
+    if not request.user.is_superuser and (
+        not request.user.is_staff or has_cashier_membership
+    ):
+        return JsonResponse(
+            {"detail": "Administrator access is required."},
+            status=403,
+        )
+    return None
+
+
 def _branch_policy(branch):
     return BranchCompliancePolicy.objects.filter(branch=branch).first()
 
@@ -218,8 +261,8 @@ def _queue_pos_event(sale):
     )
 
 
-def _batch_data(batch):
-    return {
+def _batch_data(batch, include_cost=True):
+    data = {
         "id": batch.id,
         "sku": batch.product.sku,
         "name": batch.product.name,
@@ -230,31 +273,42 @@ def _batch_data(batch):
         "expiry": batch.expiry.isoformat(),
         "supplier": batch.supplier,
         "reference": batch.reference,
-        "purchaseCost": float(batch.purchase_cost),
         "sellingPrice": float(batch.selling_price),
         "requiresPrescription": batch.product.requires_prescription,
         "isControlled": batch.product.is_controlled,
         "controlledSchedule": batch.product.controlled_schedule,
         "barcode": batch.product.barcode,
     }
+    if include_cost:
+        data["purchaseCost"] = float(batch.purchase_cost)
+    return data
 
 
-def _sale_data(sale):
-    return {
+def _sale_data(sale, include_cost=True):
+    data = {
         "id": str(sale.pk),
         "sku": sale.sku,
         "name": sale.name,
         "quantity": sale.quantity,
         "saleAmount": float(sale.sale_amount),
-        "costAmount": float(sale.cost_amount),
-        "grossProfit": float(sale.sale_amount - sale.cost_amount),
         "amountReceived": float(sale.amount_received),
         "balanceDue": float(sale.balance_due),
         "paymentMethod": sale.payment_method,
         "recipient": sale.recipient,
         "reference": sale.reference,
         "recordedAt": sale.recorded_at.isoformat(),
+        "approvalStatus": sale.approval_status,
+        "proposedAmountReceived": float(sale.approval_amount_received),
+        "proposedPaymentMethod": sale.approval_payment_method,
+        "submittedBy": sale.actor.get_username() if sale.actor else "",
+        "approvedBy": sale.approved_by.get_username() if sale.approved_by else "",
+        "approvedAt": sale.approved_at.isoformat() if sale.approved_at else None,
+        "rejectionReason": sale.rejection_reason,
     }
+    if include_cost:
+        data["costAmount"] = float(sale.cost_amount)
+        data["grossProfit"] = float(sale.sale_amount - sale.cost_amount)
+    return data
 
 
 def _invoice_data(invoice):
@@ -305,6 +359,9 @@ def branch_staff_view(request):
     branch, error = _branch_for_user(request, _branch_id(request))
     if error:
         return error
+    error = _require_roles(request, branch, {"branch_manager"})
+    if error:
+        return error
     members = BranchMembership.objects.filter(
         branch=branch,
         is_active=True,
@@ -352,8 +409,9 @@ def create_product(request):
         return error
     if not request.user.is_authenticated:
         return JsonResponse({"detail": "Authentication required."}, status=401)
-    if not request.user.is_staff:
-        return JsonResponse({"detail": "Administrator access is required to manage the product catalog."}, status=403)
+    error = _require_catalog_admin(request)
+    if error:
+        return error
     sku = str(data.get("sku", "")).strip()
     name = str(data.get("name", "")).strip()
     category = str(data.get("category", "")).strip()
@@ -400,8 +458,9 @@ def create_supplier(request):
         return error
     if not request.user.is_authenticated:
         return JsonResponse({"detail": "Authentication required."}, status=401)
-    if not request.user.is_staff:
-        return JsonResponse({"detail": "Administrator access is required to manage suppliers."}, status=403)
+    error = _require_catalog_admin(request)
+    if error:
+        return error
     name = str(data.get("name", "")).strip()
     if not name:
         return JsonResponse({"detail": "Supplier name is required."}, status=400)
@@ -426,8 +485,9 @@ def set_supplier_product(request):
         return error
     if not request.user.is_authenticated:
         return JsonResponse({"detail": "Authentication required."}, status=401)
-    if not request.user.is_staff:
-        return JsonResponse({"detail": "Administrator access is required."}, status=403)
+    error = _require_catalog_admin(request)
+    if error:
+        return error
     try:
         supplier = Supplier.objects.get(pk=int(data.get("supplierId")), is_active=True)
         product = MedicationProduct.objects.get(sku=str(data.get("sku", "")).strip(), is_active=True)
@@ -462,6 +522,9 @@ def dashboard_data(request):
     if error:
         return error
 
+    role = _branch_role_for_user(request, branch)
+    can_manage_branch = role in {"branch_manager", "administrator"}
+    can_view_cost = role != BranchMembership.Role.CASHIER
     batches = MedicineBatch.objects.filter(branch=branch)
     movements = StockMovement.objects.filter(branch=branch).select_related("batch")
     sales = Sale.objects.filter(branch=branch)
@@ -469,7 +532,7 @@ def dashboard_data(request):
     supplier_payments = SupplierPayment.objects.filter(invoice__branch=branch).select_related("invoice")
     customer_payments = CustomerPayment.objects.filter(sale__branch=branch).select_related("sale")
     return JsonResponse({
-        "inventory": [_batch_data(batch) for batch in batches],
+        "inventory": [_batch_data(batch, include_cost=can_view_cost) for batch in batches],
         "stockMovements": [
             {
                 "id": movement.id,
@@ -485,8 +548,12 @@ def dashboard_data(request):
             }
             for movement in movements
         ],
-        "sales": [_sale_data(sale) for sale in sales],
-        "supplierInvoices": [_invoice_data(invoice) for invoice in invoices],
+        "sales": [_sale_data(sale, include_cost=can_view_cost) for sale in sales],
+        "supplierInvoices": (
+            [_invoice_data(invoice) for invoice in invoices]
+            if can_manage_branch
+            else []
+        ),
         "supplierPayments": [
             {
                 "id": payment.id,
@@ -499,7 +566,7 @@ def dashboard_data(request):
                 "recordedAt": payment.recorded_at.isoformat(),
             }
             for payment in supplier_payments
-        ],
+        ] if can_manage_branch else [],
         "customerPayments": [
             {
                 "id": payment.id,
@@ -522,6 +589,9 @@ def create_batch(request):
     if error:
         return error
     branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
     try:
@@ -606,6 +676,9 @@ def dispense_stock(request):
     branch, error = _branch_for_user(request, _branch_id(request, data))
     if error:
         return error
+    error = _require_roles(request, branch, {"cashier", "pharmacist", "branch_manager"})
+    if error:
+        return error
 
     sku = str(data.get("sku", "")).strip()
     recipient = str(data.get("recipient", "")).strip()
@@ -620,6 +693,24 @@ def dispense_stock(request):
         return JsonResponse({"detail": "Enter a valid quantity, medicine, recipient, and reference."}, status=400)
     if transaction_type not in ("Sale", "Non-sale issue"):
         return JsonResponse({"detail": "Select a valid transaction type."}, status=400)
+    membership_role = BranchMembership.objects.filter(
+        user=request.user,
+        branch=branch,
+        is_active=True,
+    ).values_list("role", flat=True).first()
+    if transaction_type == "Sale" and membership_role not in {
+        BranchMembership.Role.CASHIER,
+        BranchMembership.Role.PHARMACIST,
+        BranchMembership.Role.BRANCH_MANAGER,
+    }:
+        return JsonResponse(
+            {"detail": "An active cashier, pharmacist, or branch-manager membership is required to record a sale."},
+            status=403,
+        )
+    if transaction_type == "Non-sale issue":
+        error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
+        if error:
+            return error
     payment_method = str(data.get("paymentMethod", "")).strip()
     if transaction_type == "Sale" and not payment_method:
         return JsonResponse({"detail": "Select a payment method for the sale."}, status=400)
@@ -678,6 +769,7 @@ def dispense_stock(request):
 
         sale = None
         if transaction_type == "Sale":
+            is_cashier = membership_role == BranchMembership.Role.CASHIER
             sale = Sale.objects.create(
                 branch=branch,
                 sku=sku,
@@ -685,13 +777,33 @@ def dispense_stock(request):
                 quantity=quantity,
                 sale_amount=sale_amount,
                 cost_amount=cost_amount,
-                amount_received=amount_received,
-                balance_due=sale_amount - amount_received,
-                payment_method=payment_method,
+                amount_received=Decimal("0.00") if is_cashier else amount_received,
+                balance_due=sale_amount if is_cashier else sale_amount - amount_received,
+                payment_method="" if is_cashier else payment_method,
                 recipient=recipient,
                 reference=reference,
                 actor=request.user,
+                approval_status=(
+                    Sale.ApprovalStatus.PENDING
+                    if is_cashier
+                    else Sale.ApprovalStatus.APPROVED
+                ),
+                approval_amount_received=amount_received,
+                approval_payment_method=payment_method,
+                approved_by=None if is_cashier else request.user,
+                approved_at=None if is_cashier else timezone.now(),
             )
+            if is_cashier:
+                _record_audit(
+                    request,
+                    branch,
+                    AuditEvent.Action.CREATED,
+                    "sale",
+                    sale.pk,
+                    _sale_data(sale, include_cost=False),
+                    reference,
+                )
+                return JsonResponse({"sale": _sale_data(sale, include_cost=False)}, status=202)
             if amount_received > 0:
                 CustomerPayment.objects.create(
                     sale=sale,
@@ -743,6 +855,9 @@ def stock_count(request):
     if error:
         return error
     branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
     try:
@@ -975,6 +1090,9 @@ def customer_payment(request, sale_id):
     branch, error = _branch_for_user(request, _branch_id(request, data))
     if error:
         return error
+    error = _require_roles(request, branch, {"cashier", "pharmacist", "branch_manager"})
+    if error:
+        return error
     try:
         amount = _money(data.get("amount"), "Payment amount")
     except ValueError as exc:
@@ -988,6 +1106,8 @@ def customer_payment(request, sale_id):
             sale = Sale.objects.select_for_update().get(pk=sale_id, branch=branch)
         except Sale.DoesNotExist:
             return JsonResponse({"detail": "Sale not found."}, status=404)
+        if sale.approval_status != Sale.ApprovalStatus.APPROVED:
+            return JsonResponse({"detail": "Only pharmacist-approved sales can receive payments."}, status=409)
         if amount > sale.balance_due:
             return JsonResponse({"detail": "Payment exceeds the outstanding sale balance."}, status=400)
         sale.amount_received += amount
@@ -1017,6 +1137,165 @@ def customer_payment(request, sale_id):
             },
         )
     return JsonResponse({"paymentId": payment.pk}, status=201)
+
+
+@require_POST
+def approve_sale(request, sale_id):
+    data, error = _json_body(request)
+    if error:
+        return error
+    branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_pharmacist(request, branch)
+    if error:
+        return error
+
+    with transaction.atomic():
+        try:
+            sale = Sale.objects.select_for_update().get(pk=sale_id, branch=branch)
+        except Sale.DoesNotExist:
+            return JsonResponse({"detail": "Sale not found."}, status=404)
+        if sale.approval_status != Sale.ApprovalStatus.PENDING:
+            return JsonResponse({"detail": "Only pending sales can be approved."}, status=409)
+
+        product = MedicationProduct.objects.filter(sku=sale.sku, is_active=True).first()
+        if product is None or product.requires_prescription or product.is_controlled:
+            return JsonResponse(
+                {"detail": "This sale requires the prescription workflow and cannot be approved here."},
+                status=409,
+            )
+        batches = list(
+            MedicineBatch.objects.select_for_update()
+            .filter(
+                branch=branch,
+                product=product,
+                quantity__gt=0,
+                expiry__gte=date.today(),
+            )
+            .order_by("expiry", "id")
+        )
+        if sum(batch.quantity for batch in batches) < sale.quantity:
+            return JsonResponse({"detail": "Insufficient unexpired stock to approve this sale."}, status=409)
+
+        allocations = []
+        remaining = sale.quantity
+        for batch in batches:
+            allocated = min(batch.quantity, remaining)
+            if allocated:
+                allocations.append((batch, allocated))
+                remaining -= allocated
+            if remaining == 0:
+                break
+
+        total = sum(
+            (batch.selling_price * quantity for batch, quantity in allocations),
+            Decimal("0.00"),
+        )
+        cost = sum(
+            (batch.purchase_cost * quantity for batch, quantity in allocations),
+            Decimal("0.00"),
+        )
+        if total != sale.sale_amount:
+            return JsonResponse(
+                {"detail": "Stock prices changed since checkout. Reject this request and create a new sale."},
+                status=409,
+            )
+        if sale.approval_amount_received > total:
+            return JsonResponse({"detail": "The proposed payment exceeds the sale total."}, status=409)
+
+        sale.cost_amount = cost
+        sale.amount_received = sale.approval_amount_received
+        sale.balance_due = total - sale.amount_received
+        sale.payment_method = sale.approval_payment_method
+        sale.approval_status = Sale.ApprovalStatus.APPROVED
+        sale.approved_by = request.user
+        sale.approved_at = timezone.now()
+        sale.save(update_fields=[
+            "cost_amount",
+            "amount_received",
+            "balance_due",
+            "payment_method",
+            "approval_status",
+            "approved_by",
+            "approved_at",
+        ])
+        if sale.amount_received > 0:
+            CustomerPayment.objects.create(
+                sale=sale,
+                amount=sale.amount_received,
+                method=sale.payment_method,
+                reference=sale.reference,
+                actor=sale.actor or request.user,
+            )
+        for batch, quantity in allocations:
+            batch.quantity -= quantity
+            batch.save(update_fields=["quantity", "updated_at"])
+            StockMovement.objects.create(
+                branch=branch,
+                batch=batch,
+                type=StockMovement.Type.SALE,
+                quantity=-quantity,
+                recipient=sale.recipient,
+                reference=sale.reference,
+                actor=request.user,
+                sale=sale,
+            )
+            SaleLine.objects.create(
+                sale=sale,
+                batch=batch,
+                quantity=quantity,
+                purchase_cost=batch.purchase_cost,
+                selling_price=batch.selling_price,
+            )
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.SALE_RECORDED,
+            "sale",
+            sale.pk,
+            _sale_data(sale),
+            sale.reference,
+        )
+        _queue_pos_event(sale)
+    return JsonResponse({"sale": _sale_data(sale)})
+
+
+@require_POST
+def reject_sale(request, sale_id):
+    data, error = _json_body(request)
+    if error:
+        return error
+    branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_pharmacist(request, branch)
+    if error:
+        return error
+    reason = str(data.get("reason", "")).strip()
+    if not reason:
+        return JsonResponse({"detail": "A reason is required to reject a sale."}, status=400)
+    with transaction.atomic():
+        try:
+            sale = Sale.objects.select_for_update().get(pk=sale_id, branch=branch)
+        except Sale.DoesNotExist:
+            return JsonResponse({"detail": "Sale not found."}, status=404)
+        if sale.approval_status != Sale.ApprovalStatus.PENDING:
+            return JsonResponse({"detail": "Only pending sales can be rejected."}, status=409)
+        sale.approval_status = Sale.ApprovalStatus.REJECTED
+        sale.rejected_by = request.user
+        sale.rejection_reason = reason
+        sale.save(update_fields=["approval_status", "rejected_by", "rejection_reason"])
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.UPDATED,
+            "sale",
+            sale.pk,
+            _sale_data(sale),
+            sale.reference,
+        )
+    return JsonResponse({"sale": _sale_data(sale)})
 
 
 def _prescription_data(prescription):
@@ -1077,8 +1356,9 @@ def add_barcode_alias(request):
         return error
     if not request.user.is_authenticated:
         return JsonResponse({"detail": "Authentication required."}, status=401)
-    if not request.user.is_superuser and not request.user.is_staff:
-        return JsonResponse({"detail": "Administrator access is required."}, status=403)
+    error = _require_catalog_admin(request)
+    if error:
+        return error
     value = str(data.get("value", "")).strip()
     sku = str(data.get("sku", "")).strip()
     try:
@@ -1104,6 +1384,9 @@ def prescriptions_view(request):
     branch, error = _branch_for_user(request, _branch_id(request))
     if error:
         return error
+    error = _require_pharmacist(request, branch)
+    if error:
+        return error
     prescriptions = Prescription.objects.filter(branch=branch).prefetch_related("lines__product")
     return JsonResponse({"prescriptions": [_prescription_data(item) for item in prescriptions]})
 
@@ -1114,6 +1397,9 @@ def create_prescription(request):
     if error:
         return error
     branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_pharmacist(request, branch)
     if error:
         return error
     lines = data.get("lines")
@@ -1187,6 +1473,9 @@ def verify_prescription(request, prescription_id):
     branch, error = _branch_for_user(request, _branch_id(request, data))
     if error:
         return error
+    error = _require_pharmacist(request, branch)
+    if error:
+        return error
     try:
         prescription = Prescription.objects.prefetch_related("lines__product").get(
             pk=prescription_id,
@@ -1218,6 +1507,9 @@ def dispense_prescription(request, prescription_id):
     if error:
         return error
     branch, error = _branch_for_user(request, _branch_id(request, data))
+    if error:
+        return error
+    error = _require_pharmacist(request, branch)
     if error:
         return error
     try:
@@ -1300,6 +1592,9 @@ def dispense_prescription(request, prescription_id):
             recipient=recipient,
             reference=reference,
             actor=request.user,
+            approval_status=Sale.ApprovalStatus.APPROVED,
+            approved_by=request.user,
+            approved_at=timezone.now(),
         )
         if amount_received > 0:
             CustomerPayment.objects.create(
@@ -1422,6 +1717,9 @@ def create_purchase_order(request):
 @require_GET
 def purchase_orders_view(request):
     branch, error = _branch_for_user(request, _branch_id(request))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
     orders = PurchaseOrder.objects.filter(branch=branch).select_related("supplier").prefetch_related("lines__product")
@@ -1551,6 +1849,9 @@ def receive_purchase_order(request, order_id):
 @require_GET
 def reorder_suggestions_view(request):
     branch, error = _branch_for_user(request, _branch_id(request))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
     rows = []
@@ -1737,6 +2038,9 @@ def create_transfer(request):
 @require_GET
 def transfers_view(request):
     branch, error = _branch_for_user(request, _branch_id(request))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"branch_manager"})
     if error:
         return error
     transfers = BranchTransfer.objects.filter(
@@ -1984,6 +2288,9 @@ def receive_transfer(request, transfer_id):
 @require_GET
 def analytics_report(request):
     branch, error = _branch_for_user(request, _branch_id(request))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"branch_manager"})
     if error:
         return error
     try:

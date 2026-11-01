@@ -30,6 +30,8 @@ urlpatterns = [
         name="reconcile-supplier-invoice",
     ),
     path("sales/<int:sale_id>/payments/", views.customer_payment, name="customer-payment"),
+    path("sales/<int:sale_id>/approve/", views.approve_sale, name="approve-sale"),
+    path("sales/<int:sale_id>/reject/", views.reject_sale, name="reject-sale"),
     path("barcode/lookup/", views.barcode_lookup, name="barcode-lookup"),
     path("barcode/aliases/", views.add_barcode_alias, name="barcode-alias"),
     path("prescriptions/", views.prescriptions_view, name="prescriptions"),

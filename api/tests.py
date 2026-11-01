@@ -52,6 +52,14 @@ class InventoryApiTests(TestCase):
         membership.role = BranchMembership.Role.BRANCH_MANAGER
         membership.save(update_fields=["role"])
 
+    def make_cashier(self, branch=None):
+        membership = BranchMembership.objects.get(
+            user=self.user,
+            branch=branch or self.branch,
+        )
+        membership.role = BranchMembership.Role.CASHIER
+        membership.save(update_fields=["role"])
+
     def create_batch(self, **overrides):
         data = {
             "branchId": self.branch.id,
@@ -156,6 +164,234 @@ class InventoryApiTests(TestCase):
         self.assertEqual(sale.balance_due, 0)
         self.assertEqual(CustomerPayment.objects.count(), 2)
         self.assertEqual(AuditEvent.objects.filter(entity_type="sale").count(), 2)
+
+    def test_cashier_sale_requires_distinct_pharmacist_approval(self):
+        self.create_batch()
+        self.make_cashier()
+        pending = self.post_json(
+            "/api/dispense/",
+            {
+                "branchId": self.branch.id,
+                "sku": "MED-001",
+                "transactionType": "Sale",
+                "quantity": 2,
+                "recipient": "Customer",
+                "reference": "SALE-PENDING",
+                "amountReceived": "4.00",
+                "paymentMethod": "Cash",
+            },
+        )
+
+        self.assertEqual(pending.status_code, 202, pending.content)
+        sale = Sale.objects.get()
+        self.assertEqual(sale.approval_status, Sale.ApprovalStatus.PENDING)
+        self.assertEqual(sale.actor, self.user)
+        self.assertIsNone(sale.approved_by)
+        self.assertEqual(sale.approval_amount_received, 4)
+        self.assertEqual(sale.amount_received, 0)
+        self.assertEqual(MedicineBatch.objects.get().quantity, 10)
+        self.assertEqual(StockMovement.objects.count(), 1)
+        self.assertEqual(CustomerPayment.objects.count(), 0)
+
+        payment = self.post_json(
+            f"/api/sales/{sale.pk}/payments/",
+            {
+                "branchId": self.branch.id,
+                "amount": "1.00",
+                "method": "Cash",
+                "reference": "EARLY-PAY",
+            },
+        )
+        self.assertEqual(payment.status_code, 409)
+
+        self.assertNotIn(
+            "purchaseCost",
+            self.client.get(f"/api/data/?branchId={self.branch.id}").json()["inventory"][0],
+        )
+        self.assertNotIn(
+            "grossProfit",
+            self.client.get(f"/api/data/?branchId={self.branch.id}").json()["sales"][0],
+        )
+
+        denied = self.post_json(
+            f"/api/sales/{sale.pk}/approve/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        pharmacist = get_user_model().objects.create_user(
+            username="approving-pharmacist",
+            password="test-password",
+        )
+        BranchMembership.objects.create(
+            user=pharmacist,
+            branch=self.branch,
+            role=BranchMembership.Role.PHARMACIST,
+        )
+        self.client.force_login(pharmacist)
+        approved = self.post_json(
+            f"/api/sales/{sale.pk}/approve/",
+            {"branchId": self.branch.id},
+        )
+        self.assertEqual(approved.status_code, 200, approved.content)
+        sale.refresh_from_db()
+        self.assertEqual(sale.approval_status, Sale.ApprovalStatus.APPROVED)
+        self.assertEqual(sale.approved_by, pharmacist)
+        self.assertEqual(sale.amount_received, 4)
+        self.assertEqual(sale.balance_due, 6)
+        self.assertEqual(MedicineBatch.objects.get().quantity, 8)
+        self.assertEqual(CustomerPayment.objects.get().actor, self.user)
+        movement = StockMovement.objects.get(type=StockMovement.Type.SALE)
+        self.assertEqual(movement.actor, pharmacist)
+        self.assertEqual(sale.lines.get().quantity, 2)
+
+    def test_cashier_cannot_adjust_stock_or_access_prescriptions(self):
+        self.create_batch()
+        self.make_cashier()
+        self.user.is_staff = True
+        self.user.save(update_fields=["is_staff"])
+        stock_count = self.post_json(
+            "/api/stock-count/",
+            {
+                "branchId": self.branch.id,
+                "batch": "LOT-001",
+                "quantity": 9,
+                "reason": "Counting correction",
+                "reference": "COUNT-DENIED",
+            },
+        )
+        non_sale_issue = self.post_json(
+            "/api/dispense/",
+            {
+                "branchId": self.branch.id,
+                "sku": "MED-001",
+                "transactionType": "Non-sale issue",
+                "quantity": 1,
+                "recipient": "Waste",
+                "reference": "ISSUE-DENIED",
+            },
+        )
+        prescriptions = self.client.get(f"/api/prescriptions/?branchId={self.branch.id}")
+        catalog_update = self.post_json(
+            "/api/products/create/",
+            {"sku": "MED-002", "name": "Other", "category": "General"},
+        )
+
+        self.assertEqual(stock_count.status_code, 403)
+        self.assertEqual(non_sale_issue.status_code, 403)
+        self.assertEqual(prescriptions.status_code, 403)
+        self.assertEqual(catalog_update.status_code, 403)
+        self.assertEqual(MedicineBatch.objects.get().quantity, 10)
+
+    def test_administrator_without_branch_role_cannot_finalize_sales(self):
+        self.create_batch()
+        administrator = get_user_model().objects.create_superuser(
+            username="global-administrator",
+            password="test-password",
+        )
+        self.client.force_login(administrator)
+        response = self.post_json(
+            "/api/dispense/",
+            {
+                "branchId": self.branch.id,
+                "sku": "MED-001",
+                "transactionType": "Sale",
+                "quantity": 1,
+                "recipient": "Customer",
+                "reference": "SALE-NO-ROLE",
+                "amountReceived": "0.00",
+                "paymentMethod": "Credit",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Sale.objects.count(), 0)
+        self.assertEqual(MedicineBatch.objects.get().quantity, 10)
+
+    def test_sale_approval_rejects_price_changes_since_cashier_checkout(self):
+        self.create_batch()
+        self.make_cashier()
+        pending = self.post_json(
+            "/api/dispense/",
+            {
+                "branchId": self.branch.id,
+                "sku": "MED-001",
+                "transactionType": "Sale",
+                "quantity": 1,
+                "recipient": "Customer",
+                "reference": "SALE-PRICE-CHANGE",
+                "amountReceived": "0.00",
+                "paymentMethod": "Credit",
+            },
+        )
+        sale = Sale.objects.get()
+        pharmacist = get_user_model().objects.create_user(
+            username="price-approving-pharmacist",
+            password="test-password",
+        )
+        BranchMembership.objects.create(
+            user=pharmacist,
+            branch=self.branch,
+            role=BranchMembership.Role.PHARMACIST,
+        )
+        batch = MedicineBatch.objects.get()
+        batch.selling_price = 6
+        batch.save(update_fields=["selling_price"])
+        self.client.force_login(pharmacist)
+        approval = self.post_json(
+            f"/api/sales/{sale.pk}/approve/",
+            {"branchId": self.branch.id},
+        )
+
+        self.assertEqual(pending.status_code, 202)
+        self.assertEqual(approval.status_code, 409)
+        sale.refresh_from_db()
+        self.assertEqual(sale.approval_status, Sale.ApprovalStatus.PENDING)
+        self.assertEqual(MedicineBatch.objects.get().quantity, 10)
+        self.assertEqual(CustomerPayment.objects.count(), 0)
+        self.assertEqual(StockMovement.objects.count(), 1)
+
+    def test_rejecting_cashier_sale_leaves_stock_and_payments_unchanged(self):
+        self.create_batch()
+        self.make_cashier()
+        pending = self.post_json(
+            "/api/dispense/",
+            {
+                "branchId": self.branch.id,
+                "sku": "MED-001",
+                "transactionType": "Sale",
+                "quantity": 1,
+                "recipient": "Customer",
+                "reference": "SALE-REJECT",
+                "amountReceived": "0.00",
+                "paymentMethod": "Credit",
+            },
+        )
+        sale = Sale.objects.get()
+        pharmacist = get_user_model().objects.create_user(
+            username="rejecting-pharmacist",
+            password="test-password",
+        )
+        BranchMembership.objects.create(
+            user=pharmacist,
+            branch=self.branch,
+            role=BranchMembership.Role.PHARMACIST,
+        )
+        self.client.force_login(pharmacist)
+        rejected = self.post_json(
+            f"/api/sales/{sale.pk}/reject/",
+            {"branchId": self.branch.id, "reason": "Verify item and quantity."},
+        )
+
+        self.assertEqual(pending.status_code, 202)
+        self.assertEqual(rejected.status_code, 200, rejected.content)
+        sale.refresh_from_db()
+        self.assertEqual(sale.approval_status, Sale.ApprovalStatus.REJECTED)
+        self.assertEqual(sale.rejected_by, pharmacist)
+        self.assertEqual(sale.rejection_reason, "Verify item and quantity.")
+        self.assertEqual(MedicineBatch.objects.get().quantity, 10)
+        self.assertEqual(CustomerPayment.objects.count(), 0)
+        self.assertEqual(StockMovement.objects.count(), 1)
 
     def test_supplier_invoice_and_payment_are_persisted(self):
         self.make_manager()

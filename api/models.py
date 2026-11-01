@@ -38,6 +38,7 @@ class BranchCompliancePolicy(models.Model):
 
 class BranchMembership(models.Model):
     class Role(models.TextChoices):
+        CASHIER = "cashier", "Cashier"
         PHARMACIST = "pharmacist", "Pharmacist"
         BRANCH_MANAGER = "branch_manager", "Branch manager"
 
@@ -247,6 +248,11 @@ class StockMovement(models.Model):
 
 
 class Sale(models.Model):
+    class ApprovalStatus(models.TextChoices):
+        PENDING = "pending", "Pending pharmacist approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
     branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name="sales")
     sku = models.CharField(max_length=40)
     name = models.CharField(max_length=160)
@@ -264,6 +270,29 @@ class Sale(models.Model):
         null=True,
         related_name="recorded_sales",
     )
+    approval_status = models.CharField(
+        max_length=12,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.APPROVED,
+    )
+    approval_amount_received = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    approval_payment_method = models.CharField(max_length=40, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="approved_sales",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="rejected_sales",
+    )
+    rejection_reason = models.TextField(blank=True)
     recorded_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
