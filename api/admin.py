@@ -2,12 +2,12 @@ from django.contrib import admin
 
 from .models import (
     AuditEvent,
-    BarcodeAlias,
     Branch,
     BranchCompliancePolicy,
     BranchMembership,
     BranchTransfer,
     ControlledDrugRegisterEntry,
+    EmailNotification,
     ExternalIntegrationEvent,
     MedicineBatch,
     MedicationProduct,
@@ -44,14 +44,15 @@ class MedicationProductAdmin(admin.ModelAdmin):
     list_display = (
         "sku",
         "name",
+        "product_type",
         "category",
-        "barcode",
+        "brand",
         "requires_prescription",
         "is_controlled",
         "is_active",
     )
-    list_filter = ("category", "requires_prescription", "is_controlled", "is_active")
-    search_fields = ("sku", "name", "barcode")
+    list_filter = ("product_type", "category", "requires_prescription", "is_controlled", "is_active")
+    search_fields = ("sku", "name", "brand")
 
 
 @admin.register(Supplier)
@@ -74,12 +75,6 @@ class MedicineBatchAdmin(admin.ModelAdmin):
     search_fields = ("batch", "product__sku", "product__name")
     list_filter = ("branch", "expiry")
     readonly_fields = ("quantity", "created_at", "updated_at")
-
-
-@admin.register(BarcodeAlias)
-class BarcodeAliasAdmin(admin.ModelAdmin):
-    list_display = ("value", "product", "symbology", "is_primary")
-    search_fields = ("value", "product__sku", "product__name")
 
 
 @admin.register(PurchaseOrder)
@@ -149,6 +144,30 @@ class AuditEventAdmin(admin.ModelAdmin):
         "created_at",
     )
     ordering = ("-created_at",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(EmailNotification)
+class EmailNotificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at",
+        "notification_type",
+        "recipient_email",
+        "status",
+        "attempts",
+        "sent_at",
+    )
+    list_filter = ("notification_type", "status", "created_at")
+    search_fields = ("event_key", "recipient_email", "subject")
+    readonly_fields = tuple(field.name for field in EmailNotification._meta.fields)
 
     def has_add_permission(self, request):
         return False

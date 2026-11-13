@@ -64,6 +64,15 @@ procedures before storing operational data. Keep Django, PostgreSQL, and
 dependencies patched; review `check --deploy` output for the actual hosting
 topology. Do not expose Django's development server to the public internet.
 
+Serve the production frontend build from an HTTPS origin and route `/api/`
+requests to Django on that same origin. The offline service worker is registered
+at `/service-worker.js` with root scope; it caches only the frontend shell and
+static assets, never API responses. Offline browser storage is sensitive and
+must be used only on access-controlled pharmacy devices. Review the
+[offline-operation notes](./PROJECT-WIREFRAME.md#delivery-status) before
+rolling out offline access and consult the [AI roadmap](./PROJECT-WIREFRAME.md#ai-roadmap)
+before planning future AI features.
+
 `check --deploy` may report `security.W005` because HSTS subdomain coverage is
 disabled by default, and `security.W021` because HSTS preload is not enabled.
 Enable subdomain coverage only after confirming every subdomain is HTTPS-only;

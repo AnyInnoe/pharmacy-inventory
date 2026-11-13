@@ -1,9 +1,154 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
+
+function isNetworkError(error) {
+  return (
+    !navigator.onLine ||
+    error instanceof TypeError ||
+    error instanceof SyntaxError ||
+    error.status >= 500
+  )
+}
+
+function readPreferredTheme() {
+  try {
+    return window.localStorage.getItem('wellnest-theme') === 'dark'
+      ? 'dark'
+      : 'light'
+  } catch (error) {
+    console.error('Could not read the saved dashboard theme.', error)
+    return 'light'
+  }
+}
+
+function getOfflineOwnerKey(user) {
+  return String(user.id ?? user.username)
+}
+
+function readCachedSession() {
+  try {
+    const cached = sessionStorage.getItem('wellnest-session')
+    return cached ? JSON.parse(cached) : null
+  } catch (error) {
+    console.error('Could not read the cached offline session.', error)
+    sessionStorage.removeItem('wellnest-session')
+    return null
+  }
+}
+
+function saveCachedSession(user, branches) {
+  try {
+    sessionStorage.setItem('wellnest-session', JSON.stringify({ user, branches }))
+    return true
+  } catch (error) {
+    console.error('Could not save the offline session cache.', error)
+    return false
+  }
+}
+
+function saveCachedUser(user) {
+  const cachedSession = readCachedSession()
+  const branches = cachedSession?.user?.id === user.id
+    ? cachedSession.branches || []
+    : []
+  return saveCachedSession(user, branches)
+}
+
+function branchCacheKey(ownerKey, branchId) {
+  return `wellnest-branch:${ownerKey}:${branchId}`
+}
+
+function readCachedBranch(ownerKey, branchId) {
+  const key = branchCacheKey(ownerKey, branchId)
+  try {
+    const cached = sessionStorage.getItem(key)
+    return cached ? JSON.parse(cached) : null
+  } catch (error) {
+    console.error('Could not read the cached branch inventory.', error)
+    sessionStorage.removeItem(key)
+    return null
+  }
+}
+
+function saveCachedBranch(ownerKey, branchId, inventory, products) {
+  try {
+    sessionStorage.setItem(
+      branchCacheKey(ownerKey, branchId),
+      JSON.stringify({ inventory, products }),
+    )
+    return true
+  } catch (error) {
+    console.error('Could not save the cached branch inventory.', error)
+    return false
+  }
+}
+
+function openOfflineDraftStore() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('This browser does not support safely storing offline POS drafts.'))
+      return
+    }
+    const request = window.indexedDB.open('wellnest-offline', 1)
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore('drafts', { keyPath: 'id' })
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error || new Error('Could not open the offline POS queue.'))
+  })
+}
+
+async function getOfflineDrafts(ownerKey) {
+  const database = await openOfflineDraftStore()
+  return new Promise((resolve, reject) => {
+    const request = database.transaction('drafts', 'readonly').objectStore('drafts').getAll()
+    request.onsuccess = () => {
+      database.close()
+      resolve(request.result.filter((draft) => draft.ownerKey === ownerKey))
+    }
+    request.onerror = () => {
+      database.close()
+      reject(request.error || new Error('Could not read the offline POS queue.'))
+    }
+  })
+}
+
+async function saveOfflineDraft(draft) {
+  const database = await openOfflineDraftStore()
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction('drafts', 'readwrite')
+    transaction.objectStore('drafts').put(draft)
+    transaction.oncomplete = () => {
+      database.close()
+      resolve()
+    }
+    transaction.onerror = () => {
+      database.close()
+      reject(transaction.error || new Error('Could not save this POS draft on the device.'))
+    }
+  })
+}
+
+async function deleteOfflineDraft(id) {
+  const database = await openOfflineDraftStore()
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction('drafts', 'readwrite')
+    transaction.objectStore('drafts').delete(id)
+    transaction.oncomplete = () => {
+      database.close()
+      resolve()
+    }
+    transaction.onerror = () => {
+      database.close()
+      reject(transaction.error || new Error('Could not remove the offline POS draft.'))
+    }
+  })
+}
 
 async function apiRequest(path, { method = 'GET', body } = {}) {
   const headers = {}
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const isFormData = body instanceof FormData
+  if (body !== undefined && !isFormData) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') {
     const csrfResponse = await fetch('/api/auth/csrf/', { credentials: 'include' })
     const csrfData = await csrfResponse.json()
@@ -17,12 +162,23 @@ async function apiRequest(path, { method = 'GET', body } = {}) {
     method,
     credentials: 'include',
     headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
   })
-  const data = await response.json()
+  let data
+  try {
+    data = await response.json()
+  } catch (error) {
+    if (error instanceof SyntaxError && !response.ok) {
+      const requestError = new Error(`The server could not complete the request (${response.status}).`)
+      requestError.status = response.status
+      throw requestError
+    }
+    throw error
+  }
   if (!response.ok) {
     const error = new Error(data.detail || 'The request failed.')
     error.code = data.code
+    error.status = response.status
     throw error
   }
   return data
@@ -80,7 +236,6 @@ const emptyBatch = {
   reorderLevel: '',
   expiry: '',
   supplier: '',
-  reference: '',
   purchaseCost: '',
   sellingPrice: '',
   witnessId: '',
@@ -91,16 +246,15 @@ const emptyDispense = {
   transactionType: 'Sale',
   quantity: '',
   recipient: '',
-  reference: '',
   amountReceived: '',
-  paymentMethod: '',
+  paymentMethod: 'Cash',
+  receiptEmail: '',
 }
 
 const emptyStockCount = {
   batch: '',
   quantity: '',
   reason: '',
-  reference: '',
   witnessId: '',
 }
 
@@ -111,20 +265,19 @@ const emptySupplierInvoice = {
   amountPaid: '0',
   dueDate: '',
   purchaseOrderId: '',
+  originalDocument: null,
 }
 
 const emptySupplierPayment = {
   invoiceId: '',
   amount: '',
   method: '',
-  reference: '',
 }
 
 const emptyCustomerPayment = {
   saleId: '',
   amount: '',
   method: '',
-  reference: '',
 }
 
 const emptyPrescription = {
@@ -144,12 +297,10 @@ const emptyPrescriptionDispense = {
   quantity: '',
   amountReceived: '0',
   paymentMethod: '',
-  reference: '',
   witnessId: '',
 }
 
 const emptyPurchaseOrder = {
-  number: '',
   supplierId: '',
   expectedDate: '',
   sku: '',
@@ -169,24 +320,28 @@ const emptyPurchaseReceipt = {
 
 const emptyTransfer = {
   destinationBranchId: '',
-  reference: '',
   sku: '',
   quantity: '',
   witnessId: '',
 }
 
 const emptyProduct = {
-  sku: '',
   name: '',
   category: '',
+  productType: 'medicine',
   unit: 'unit',
-  barcode: '',
+  brand: '',
+  skinType: '',
+  skinConcerns: '',
+  keyIngredients: '',
+  usageInstructions: '',
+  warnings: '',
+  periodAfterOpeningMonths: '',
   requiresPrescription: false,
   isControlled: false,
   controlledSchedule: '',
 }
 
-const emptyBarcodeAlias = { sku: '', value: '', symbology: '' }
 const emptySupplier = { name: '', contactName: '', email: '', phone: '', address: '' }
 const emptySupplierProduct = {
   sku: '',
@@ -198,9 +353,9 @@ const emptySupplierProduct = {
 }
 
 function getStockStatus(medicine, today = new Date()) {
-  const expiryDate = new Date(`${medicine.expiry}T00:00:00`)
-
-  if (expiryDate < today) return 'Expired'
+  if (medicine.expiry && new Date(`${medicine.expiry}T00:00:00`) < today) {
+    return 'Expired'
+  }
   if (medicine.quantity === 0) return 'Out of stock'
   if (medicine.quantity <= medicine.reorderLevel) return 'Low stock'
   return 'In stock'
@@ -225,8 +380,49 @@ function getSalePaymentStatus(sale) {
   return 'Unpaid'
 }
 
+function getSaleAllocation(inventory, sku, quantity, asOf) {
+  const eligibleBatches = inventory
+    .filter(
+      (item) =>
+        item.sku === sku &&
+        item.quantity > 0 &&
+        (
+          (item.expiry && new Date(`${item.expiry}T00:00:00`) >= asOf)
+          || (!item.expiry && item.productType === 'skin_care')
+        )
+    )
+    .sort((first, second) => {
+      if (!first.expiry) return second.expiry ? 1 : 0
+      if (!second.expiry) return -1
+      return first.expiry.localeCompare(second.expiry)
+    })
+  const availableQuantity = eligibleBatches.reduce(
+    (total, item) => total + item.quantity,
+    0,
+  )
+  let remaining = quantity
+  const allocations = []
+
+  for (const item of eligibleBatches) {
+    if (remaining === 0) break
+    const quantityFromBatch = Math.min(item.quantity, remaining)
+    allocations.push({ batch: item, quantity: quantityFromBatch })
+    remaining -= quantityFromBatch
+  }
+
+  const saleAmount = allocations.reduce(
+    (total, allocation) =>
+      total + allocation.quantity * Number(allocation.batch.sellingPrice || 0),
+    0,
+  )
+
+  return { availableQuantity, allocations, remaining, saleAmount }
+}
+
 function App() {
   const [activePage, setActivePage] = useState('Overview')
+  const [theme, setTheme] = useState(readPreferredTheme)
+  const [currentTime, setCurrentTime] = useState(() => new Date())
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
@@ -257,12 +453,17 @@ function App() {
   const [customerPaymentError, setCustomerPaymentError] = useState('')
   const [currentUser, setCurrentUser] = useState(null)
   const [authLoading, setAuthLoading] = useState(true)
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine)
+  const [offlineDrafts, setOfflineDrafts] = useState([])
+  const isSyncingOfflineDrafts = useRef(false)
+  const supplierInvoiceDocumentRef = useRef(null)
   const [authError, setAuthError] = useState('')
   const [loginUsername, setLoginUsername] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [loginSubmitting, setLoginSubmitting] = useState(false)
   const [branches, setBranches] = useState([])
   const [activeBranchId, setActiveBranchId] = useState('')
+  const [analyticsBranchId, setAnalyticsBranchId] = useState('')
   const [loadedBranchId, setLoadedBranchId] = useState('')
   const [dataError, setDataError] = useState('')
   const [products, setProducts] = useState([])
@@ -273,10 +474,11 @@ function App() {
   const [reorderSuggestions, setReorderSuggestions] = useState([])
   const [transfers, setTransfers] = useState([])
   const [analytics, setAnalytics] = useState(null)
+  const [replenishmentForecast, setReplenishmentForecast] = useState(null)
   const [workflowError, setWorkflowError] = useState('')
   const [workflowNotice, setWorkflowNotice] = useState('')
+  const [receiptSaleId, setReceiptSaleId] = useState('')
   const [saleRejectionReasons, setSaleRejectionReasons] = useState({})
-  const [barcodeInput, setBarcodeInput] = useState('')
   const [prescriptionForm, setPrescriptionForm] = useState(emptyPrescription)
   const [prescriptionDispenseForm, setPrescriptionDispenseForm] = useState(emptyPrescriptionDispense)
   const [purchaseOrderForm, setPurchaseOrderForm] = useState(emptyPurchaseOrder)
@@ -286,7 +488,6 @@ function App() {
   const [transferReceiptBatches, setTransferReceiptBatches] = useState({})
   const [transferWitnessId, setTransferWitnessId] = useState('')
   const [productForm, setProductForm] = useState(emptyProduct)
-  const [barcodeAliasForm, setBarcodeAliasForm] = useState(emptyBarcodeAlias)
   const [supplierForm, setSupplierForm] = useState(emptySupplier)
   const [supplierProductForm, setSupplierProductForm] = useState(emptySupplierProduct)
   const [reportStart, setReportStart] = useState(() => {
@@ -300,73 +501,27 @@ function App() {
     currentDate.setHours(0, 0, 0, 0)
     return currentDate
   })
+  const reportBranchId = currentUser?.isSuperuser ? analyticsBranchId : activeBranchId
+  const currentHour = currentTime.getHours()
+  const timeGreeting = currentHour < 12
+    ? 'Good morning'
+    : currentHour < 17
+      ? 'Good afternoon'
+      : 'Good evening'
 
   useEffect(() => {
-    if (!currentUser) return
-    let cancelled = false
+    const timerId = window.setInterval(() => setCurrentTime(new Date()), 60_000)
+    return () => window.clearInterval(timerId)
+  }, [])
 
-    apiRequest('/api/branches/')
-      .then(({ branches: availableBranches }) => {
-        if (cancelled) return
-        setBranches(availableBranches)
-        setActiveBranchId((current) => {
-          if (availableBranches.some((branch) => String(branch.id) === String(current))) {
-            return String(current)
-          }
-          const membershipBranch = currentUser.memberships.find((membership) =>
-            availableBranches.some((branch) => branch.id === membership.branchId)
-          )?.branchId
-          return String(membershipBranch ?? availableBranches[0]?.id ?? '')
-        })
-      })
-      .catch((error) => {
-        if (!cancelled) setDataError(error.message || 'Could not load your branches.')
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [currentUser])
-
-  useEffect(() => {
-    if (!currentUser || !activeBranchId) return
-    let cancelled = false
-
-    refreshBranchData(activeBranchId, () => !cancelled)
-      .then(() => {
-        if (!cancelled) {
-        setDataError('')
-        setLoadedBranchId(activeBranchId)
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setDataError(error.message || 'Could not load branch data.')
-          setLoadedBranchId(activeBranchId)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [currentUser, activeBranchId])
-
-  async function saveBranchAction(path, values) {
-    await apiRequest(path, {
-      method: 'POST',
-      body: { ...values, branchId: Number(activeBranchId) },
-    })
-    await refreshBranchData(activeBranchId)
-  }
-
-  async function refreshBranchData(branchId = activeBranchId, isCurrent = () => true) {
+  const refreshBranchData = useCallback(async (branchId = activeBranchId, isCurrent = () => true) => {
     if (!branchId) return
     const query = `?branchId=${encodeURIComponent(branchId)}`
     const membership = currentUser?.memberships.find(
       (item) => String(item.branchId) === String(branchId),
     )
     const canReviewClinicalWork = ['pharmacist', 'branch_manager'].includes(membership?.role)
-    const canManageBranch = currentUser?.isSuperuser || membership?.role === 'branch_manager'
+    const canManageBranch = membership?.role === 'branch_manager'
     const [data, productData, supplierData, staffData, prescriptionData, orderData, transferData, reorderData] =
       await Promise.all([
         apiRequest(`/api/data/${query}`),
@@ -392,31 +547,300 @@ function App() {
       setPurchaseOrders(orderData.purchaseOrders)
       setTransfers(transferData.transfers)
       setReorderSuggestions(reorderData.suggestions)
+      if (!saveCachedBranch(
+        getOfflineOwnerKey(currentUser),
+        branchId,
+        data.inventory,
+        productData.products,
+      )) {
+        setWorkflowNotice('Browser storage is unavailable; inventory cannot be shown offline after a reload.')
+      }
+    }
+  }, [activeBranchId, currentUser])
+
+  useEffect(() => {
+    function updateConnectionStatus() {
+      setIsOnline(navigator.onLine)
+    }
+
+    window.addEventListener('online', updateConnectionStatus)
+    window.addEventListener('offline', updateConnectionStatus)
+    return () => {
+      window.removeEventListener('online', updateConnectionStatus)
+      window.removeEventListener('offline', updateConnectionStatus)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!import.meta.env.PROD || !('serviceWorker' in navigator)) return
+
+    navigator.serviceWorker.register('/service-worker.js').catch((error) => {
+      console.error('Could not register the offline app shell.', error)
+      setWorkflowNotice('Offline app-shell caching is unavailable in this browser session.')
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!currentUser) return
+    let cancelled = false
+
+    async function loadAndSyncOfflineDrafts() {
+      const ownerKey = getOfflineOwnerKey(currentUser)
+      const queuedDrafts = await getOfflineDrafts(ownerKey)
+      if (cancelled) return
+      setOfflineDrafts(queuedDrafts.sort((first, second) => first.createdAt.localeCompare(second.createdAt)))
+      if (!isOnline || isSyncingOfflineDrafts.current) return
+
+      isSyncingOfflineDrafts.current = true
+      let acceptedCount = 0
+      try {
+        for (const draft of queuedDrafts) {
+          if (draft.status !== 'pending') continue
+          let submitError = null
+          try {
+            await apiRequest('/api/dispense/', {
+              method: 'POST',
+              body: draft.payload,
+            })
+          } catch (error) {
+            if (isNetworkError(error)) {
+              setIsOnline(false)
+              break
+            }
+            submitError = error
+          }
+          if (submitError) {
+            await saveOfflineDraft({
+              ...draft,
+              status: 'needs_review',
+              error: submitError.message || 'The server rejected this queued sale.',
+            })
+            continue
+          }
+
+          await deleteOfflineDraft(draft.id)
+          acceptedCount += 1
+          if (String(draft.branchId) === String(activeBranchId)) {
+            try {
+              await refreshBranchData(draft.branchId)
+            } catch (error) {
+              if (!isNetworkError(error)) {
+                setWorkflowError(error.message || 'The queued sale was submitted, but branch data could not be refreshed.')
+              } else {
+                setIsOnline(false)
+                setWorkflowNotice('A queued sale was submitted, but branch data could not be refreshed. Reload the dashboard when the connection is stable.')
+                break
+              }
+            }
+          }
+        }
+      } finally {
+        isSyncingOfflineDrafts.current = false
+      }
+
+      const remainingDrafts = await getOfflineDrafts(ownerKey)
+      if (!cancelled) {
+        setOfflineDrafts(remainingDrafts.sort((first, second) => first.createdAt.localeCompare(second.createdAt)))
+        if (acceptedCount > 0) {
+          setWorkflowNotice(`${acceptedCount} queued POS sale${acceptedCount === 1 ? '' : 's'} recorded after reconnection; stock and payment have been posted.`)
+        }
+      }
+    }
+
+    loadAndSyncOfflineDrafts().catch((error) => {
+      if (!cancelled) setWorkflowError(error.message || 'Could not load or sync queued POS drafts.')
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser, isOnline, activeBranchId, refreshBranchData])
+
+  useEffect(() => {
+    if (!currentUser) return
+    let cancelled = false
+
+    apiRequest('/api/branches/')
+      .then(({ branches: availableBranches }) => {
+        if (cancelled) return
+        setBranches(availableBranches)
+        if (!saveCachedSession(currentUser, availableBranches)) {
+          setWorkflowNotice('Browser storage is unavailable; this session cannot resume offline after a reload.')
+        }
+        setActiveBranchId((current) => {
+          if (
+            currentUser.memberships.some(
+              (membership) => String(membership.branchId) === String(current),
+            ) &&
+            availableBranches.some((branch) => String(branch.id) === String(current))
+          ) {
+            return String(current)
+          }
+          const membershipBranch = currentUser.memberships.find((membership) =>
+            availableBranches.some((branch) => branch.id === membership.branchId)
+          )?.branchId
+          return String(membershipBranch ?? '')
+        })
+        setAnalyticsBranchId((current) => {
+          if (availableBranches.some((branch) => String(branch.id) === String(current))) {
+            return String(current)
+          }
+          return String(availableBranches[0]?.id ?? '')
+        })
+        if (currentUser.isSuperuser && currentUser.memberships.length === 0) {
+          setActivePage('Reports')
+        }
+      })
+      .catch((error) => {
+        if (cancelled) return
+        if (isNetworkError(error)) {
+          const cachedSession = readCachedSession()
+          if (cachedSession?.user?.id === currentUser.id && cachedSession.branches?.length) {
+            setBranches(cachedSession.branches)
+            const homeBranchId = currentUser.memberships.find((membership) =>
+              cachedSession.branches.some(
+                (branch) => String(branch.id) === String(membership.branchId),
+              ),
+            )?.branchId
+            setActiveBranchId(String(homeBranchId ?? ''))
+            setAnalyticsBranchId(String(cachedSession.branches[0].id))
+            if (currentUser.isSuperuser && currentUser.memberships.length === 0) {
+              setActivePage('Reports')
+            }
+            setIsOnline(false)
+            setWorkflowNotice('Offline mode: using this user’s previously loaded branch data. Stock-changing actions require a connection.')
+            return
+          }
+        }
+        setDataError(error.message || 'Could not load your branches.')
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser])
+
+  useEffect(() => {
+    if (!currentUser || !activeBranchId) return
+    let cancelled = false
+
+    Promise.resolve()
+      .then(() => {
+        if (cancelled) return null
+        return refreshBranchData(activeBranchId, () => !cancelled)
+      })
+      .then(() => {
+        if (!cancelled) {
+          setDataError('')
+          setLoadedBranchId(activeBranchId)
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          if (isNetworkError(error)) {
+            setIsOnline(false)
+            const cachedBranch = readCachedBranch(getOfflineOwnerKey(currentUser), activeBranchId)
+            if (cachedBranch) {
+              const { inventory: cachedInventory, products: cachedProducts } = cachedBranch
+              setInventory(cachedInventory)
+              setProducts(cachedProducts)
+              setDataError('')
+              setWorkflowNotice('Offline mode: displaying cached inventory. Stock-changing and clinical actions are unavailable until reconnection.')
+              setLoadedBranchId(activeBranchId)
+              return
+            }
+            setInventory([])
+            setProducts([])
+          }
+          setDataError(error.message || 'Could not load branch data.')
+          setLoadedBranchId(activeBranchId)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentUser, activeBranchId, refreshBranchData])
+
+  async function saveBranchAction(path, values) {
+    const body = values instanceof FormData
+      ? values
+      : { ...values, branchId: Number(activeBranchId) }
+    if (body instanceof FormData) {
+      body.set('branchId', String(activeBranchId))
+    }
+    const response = await apiRequest(path, {
+      method: 'POST',
+      body,
+    })
+    await refreshBranchData(activeBranchId)
+    return response
+  }
+
+  function toggleTheme() {
+    const nextTheme = theme === 'dark' ? 'light' : 'dark'
+    setTheme(nextTheme)
+    try {
+      window.localStorage.setItem('wellnest-theme', nextTheme)
+      setWorkflowNotice('')
+    } catch (error) {
+      console.error('Could not save the dashboard theme preference.', error)
+      setWorkflowNotice('Theme changed for this session, but the preference could not be saved in browser storage.')
     }
   }
 
+  function toggleDispenseForm(transactionType) {
+    const isOpenForType =
+      showDispenseForm && dispenseForm.transactionType === transactionType
+    setShowDispenseForm(!isOpenForType)
+    setDispenseForm({ ...emptyDispense, transactionType })
+    setDispenseError('')
+  }
+
   useEffect(() => {
-    if (activePage !== 'Reports' || !activeBranchId) return
+    if (activePage !== 'Reports' || !reportBranchId) return
     let cancelled = false
     const params = new URLSearchParams({
-      branchId: activeBranchId,
+      branchId: reportBranchId,
       start: reportStart,
       end: reportEnd,
     })
     apiRequest(`/api/reports/analytics/?${params}`)
       .then((data) => {
         if (!cancelled) {
-          setAnalytics(data)
+          setAnalytics({ ...data, branchId: reportBranchId })
           setWorkflowError('')
         }
       })
       .catch((error) => {
-        if (!cancelled) setWorkflowError(error.message || 'Could not load analytics.')
+        if (!cancelled) {
+          if (isNetworkError(error)) setIsOnline(false)
+          setWorkflowError(error.message || 'Could not load analytics.')
+        }
       })
     return () => {
       cancelled = true
     }
-  }, [activePage, activeBranchId, reportStart, reportEnd])
+  }, [activePage, reportBranchId, reportStart, reportEnd])
+
+  useEffect(() => {
+    if (activePage !== 'Purchasing' || !activeBranchId) return
+    let cancelled = false
+    const params = new URLSearchParams({ branchId: activeBranchId })
+    apiRequest(`/api/reports/replenishment/?${params}`)
+      .then((data) => {
+        if (!cancelled) setReplenishmentForecast(data)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          if (isNetworkError(error)) setIsOnline(false)
+          setWorkflowError(error.message || 'Could not load replenishment forecasts.')
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activePage, activeBranchId])
 
   useEffect(() => {
     let cancelled = false
@@ -427,17 +851,48 @@ function App() {
           credentials: 'include',
         })
 
-        if (response.status === 401) return
+        if (response.status === 401) {
+          sessionStorage.removeItem('wellnest-session')
+          return
+        }
 
         const data = await response.json()
         if (!response.ok) {
           throw new Error(data.detail || 'Could not check your sign-in.')
         }
 
-        if (!cancelled) setCurrentUser(data.user)
-      } catch {
         if (!cancelled) {
-          setAuthError('Could not reach the server. Check that Django is running.')
+          setCurrentUser(data.user)
+          if (!saveCachedUser(data.user)) {
+            setAuthError('Sign-in succeeded, but offline session storage is unavailable.')
+          }
+        }
+      } catch (error) {
+        if (!cancelled && isNetworkError(error)) {
+          const cachedSession = readCachedSession()
+          if (cachedSession?.user) {
+            setCurrentUser(cachedSession.user)
+            setBranches(cachedSession.branches || [])
+            const homeBranchId = cachedSession.user.memberships?.find((membership) =>
+              cachedSession.branches?.some(
+                (branch) => String(branch.id) === String(membership.branchId),
+              ),
+            )?.branchId
+            setActiveBranchId(String(homeBranchId ?? ''))
+            setAnalyticsBranchId(String(cachedSession.branches?.[0]?.id ?? ''))
+            if (
+              cachedSession.user.isSuperuser &&
+              cachedSession.user.memberships?.length === 0
+            ) {
+              setActivePage('Reports')
+            }
+            setIsOnline(false)
+            setWorkflowNotice('Offline mode: continuing the previously signed-in browser session. New sign-ins require a connection.')
+          } else {
+            setAuthError('Could not reach the server. Sign in while connected once before using offline mode.')
+          }
+        } else if (!cancelled) {
+          setAuthError(error.message || 'Could not check your sign-in.')
         }
       } finally {
         if (!cancelled) setAuthLoading(false)
@@ -484,6 +939,9 @@ function App() {
       }
 
       setCurrentUser(data.user)
+      if (!saveCachedUser(data.user)) {
+        setAuthError('Sign-in succeeded, but offline session storage is unavailable.')
+      }
       setLoginPassword('')
     } catch (error) {
       setAuthError(error.message || 'Sign-in failed. Please try again.')
@@ -493,6 +951,10 @@ function App() {
   }
 
   async function handleLogout() {
+    if (offlineDrafts.some((draft) => draft.status === 'pending')) {
+      setAuthError('Sync or remove pending POS drafts before signing out. Drafts that need review will remain stored for this user.')
+      return
+    }
     setAuthError('')
 
     try {
@@ -514,6 +976,14 @@ function App() {
         throw new Error(data.detail || 'Sign-out failed.')
       }
 
+      const ownerKey = getOfflineOwnerKey(currentUser)
+      sessionStorage.removeItem('wellnest-session')
+      for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+        const key = sessionStorage.key(index)
+        if (key?.startsWith(`wellnest-branch:${ownerKey}:`)) {
+          sessionStorage.removeItem(key)
+        }
+      }
       window.location.reload()
     } catch (error) {
       setAuthError(error.message || 'Sign-out failed. Please try again.')
@@ -538,6 +1008,7 @@ function App() {
   ).length
 
   const expiringSoonCount = inventory.filter((medicine) => {
+    if (!medicine.expiry) return false
     const expiryDate = new Date(`${medicine.expiry}T00:00:00`)
     const daysUntilExpiry = Math.ceil(
       (expiryDate - today) / (1000 * 60 * 60 * 24)
@@ -571,7 +1042,9 @@ function App() {
   const selectedPrescriptionLine = selectedPrescription?.lines.find(
     (item) => String(item.id) === selectedPrescriptionOption[1],
   )
-  const selectedBatchProduct = products.find((item) => item.sku === newBatch.sku)
+  const selectedBatchProduct = products.find(
+    (item) => item.sku === newBatch.sku.trim(),
+  )
   const selectedCountBatch = inventory.find((item) => item.batch === stockCountForm.batch)
   const selectedReceiptOrder = purchaseOrders.find(
     (item) => String(item.id) === purchaseReceiptForm.orderId,
@@ -580,20 +1053,26 @@ function App() {
     (item) => String(item.id) === purchaseReceiptForm.lineId,
   )
   const selectedTransferProduct = products.find((item) => item.sku === transferForm.sku)
-  const canManageBranch =
-    currentUser?.isSuperuser ||
-    currentUser?.memberships.some(
+  const canManageBranch = currentUser?.memberships.some(
       (membership) =>
         String(membership.branchId) === String(activeBranchId) &&
         membership.role === 'branch_manager',
     )
-  const activeRole = currentUser?.isSuperuser
-    ? 'administrator'
-    : currentUser?.memberships.find(
-        (membership) => String(membership.branchId) === String(activeBranchId),
-      )?.role
+  const activeRole = currentUser?.memberships.find(
+    (membership) => String(membership.branchId) === String(activeBranchId),
+  )?.role
   const isCashier = activeRole === 'cashier'
   const canClinical = ['pharmacist', 'branch_manager'].includes(activeRole)
+  const canViewFinancials = canManageBranch || currentUser?.isSuperuser
+  const isCrossBranchAnalytics =
+    Boolean(currentUser?.isSuperuser) &&
+    String(reportBranchId) !== String(activeBranchId)
+  const dispenseQuantity = Number(dispenseForm.quantity)
+  const estimatedSale = dispenseForm.transactionType === 'Sale' &&
+    Number.isInteger(dispenseQuantity) &&
+    dispenseQuantity > 0
+    ? getSaleAllocation(inventory, dispenseForm.sku, dispenseQuantity, today)
+    : null
 
   function handleFormChange(event) {
     const { name, value } = event.target
@@ -631,7 +1110,6 @@ function App() {
     const sku = newBatch.sku.trim()
     const name = newBatch.name.trim()
     const supplier = newBatch.supplier.trim()
-    const reference = newBatch.reference.trim()
 
     try {
       await saveBranchAction('/api/batches/', {
@@ -643,7 +1121,6 @@ function App() {
         reorderLevel,
         expiry: newBatch.expiry,
         supplier,
-        reference,
         purchaseCost,
         sellingPrice,
         witnessId: newBatch.witnessId || null,
@@ -661,106 +1138,183 @@ function App() {
 
     const quantity = Number(dispenseForm.quantity)
     const transactionType = dispenseForm.transactionType
-    const amountReceived = Number(dispenseForm.amountReceived)
+    const amountInput = dispenseForm.amountReceived.trim()
     const paymentMethod = dispenseForm.paymentMethod
     const recipient = dispenseForm.recipient.trim()
-    const reference = dispenseForm.reference.trim()
 
-    if (!recipient || !reference || !Number.isInteger(quantity) || quantity <= 0) {
-      setDispenseError('Enter a valid quantity, recipient, and reference.')
+    if (
+      !Number.isInteger(quantity) ||
+      quantity <= 0 ||
+      (transactionType !== 'Sale' && !recipient)
+    ) {
+      setDispenseError(
+        transactionType === 'Sale'
+          ? 'Enter a valid product and quantity.'
+          : 'Enter a valid quantity and recipient.',
+      )
+      return
+    }
+
+    const canQueueOffline = transactionType === 'Sale' && isCashier
+    if (!isOnline && !canQueueOffline) {
+      setDispenseError('Only ordinary cashier POS sales can be queued offline. Stock adjustments and clinical dispensing require a connection.')
       return
     }
 
     const dispenseDate = new Date()
     dispenseDate.setHours(0, 0, 0, 0)
 
-    const eligibleBatches = inventory
-      .filter(
-        (item) =>
-          item.sku === dispenseForm.sku &&
-          item.quantity > 0 &&
-          new Date(`${item.expiry}T00:00:00`) >= dispenseDate
-      )
-      .sort((first, second) => first.expiry.localeCompare(second.expiry))
-
-    const availableQuantity = eligibleBatches.reduce(
-      (total, item) => total + item.quantity,
-      0
+    const allocation = getSaleAllocation(
+      inventory,
+      dispenseForm.sku,
+      quantity,
+      dispenseDate,
     )
 
-    if (quantity > availableQuantity) {
+    if (isOnline && quantity > allocation.availableQuantity) {
       setDispenseError(
-        `Only ${availableQuantity} units are available in non-expired batches.`
+        `Only ${allocation.availableQuantity} units are available in non-expired batches.`
       )
       return
     }
 
-    let remaining = quantity
-    const allocations = []
-
-    for (const item of eligibleBatches) {
-      if (remaining === 0) break
-
-      const quantityFromBatch = Math.min(item.quantity, remaining)
-      allocations.push({ batch: item, quantity: quantityFromBatch })
-      remaining -= quantityFromBatch
-    }
-
-    const saleAmount =
-      transactionType === 'Sale'
-        ? allocations.reduce(
-            (total, allocation) =>
-              total +
-              allocation.quantity * Number(allocation.batch.sellingPrice || 0),
-            0
-          )
-        : 0
+    const amountReceived = amountInput === ''
+      ? paymentMethod === 'Credit' ? 0 : allocation.saleAmount
+      : Number(amountInput)
 
     if (
       transactionType === 'Sale' &&
       (!paymentMethod ||
         !Number.isFinite(amountReceived) ||
         amountReceived < 0 ||
-        amountReceived > saleAmount)
+        (isOnline && amountReceived > allocation.saleAmount) ||
+        (amountInput === '' &&
+          allocation.remaining > 0 &&
+          paymentMethod !== 'Credit'))
     ) {
       setDispenseError(
-        `Enter a payment method and an amount received from 0 to ${saleAmount}.`
+        amountInput === '' && allocation.remaining > 0
+          ? 'The total is unavailable from cached stock. Enter the amount received or select Credit.'
+          : isOnline
+            ? `Enter an amount received from 0 to ${allocation.saleAmount}.`
+            : 'Enter a valid non-negative amount received.'
       )
       return
     }
 
-    try {
-      await saveBranchAction('/api/dispense/', {
-        sku: dispenseForm.sku,
-        transactionType,
-        quantity,
-        recipient,
-        reference,
-        amountReceived,
-        paymentMethod,
-      })
+    const clientRequestId = canQueueOffline ? crypto.randomUUID() : undefined
+    const payload = {
+      branchId: Number(activeBranchId),
+      sku: dispenseForm.sku,
+      transactionType,
+      quantity,
+      ...(transactionType === 'Non-sale issue' ? { recipient } : {}),
+      amountReceived,
+      paymentMethod,
+      ...(transactionType === 'Sale' && dispenseForm.receiptEmail.trim()
+        ? { receiptEmail: dispenseForm.receiptEmail.trim() }
+        : {}),
+      ...(clientRequestId ? { clientRequestId } : {}),
+    }
+
+    async function queueCashierSale(draftPayload, requestId) {
+      const ownerKey = getOfflineOwnerKey(currentUser)
+      const draft = {
+        id: requestId,
+        ownerKey,
+        branchId: activeBranchId,
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+        payload: draftPayload,
+        error: '',
+      }
+      await saveOfflineDraft(draft)
+      const queuedDrafts = await getOfflineDrafts(ownerKey)
+      setOfflineDrafts(queuedDrafts.sort((first, second) => first.createdAt.localeCompare(second.createdAt)))
       setDispenseForm(emptyDispense)
       setDispenseError('')
-      setPrescriptionRedirectSku('')
       setShowDispenseForm(false)
-      setWorkflowNotice(
-        transactionType === 'Sale' && !canClinical
-          ? 'Sale submitted. A pharmacist must approve it before stock is deducted or payment is recorded.'
-          : '',
-      )
+      setReceiptSaleId('')
+      setWorkflowNotice('POS draft saved on this device. The server will validate and record the sale when the connection returns.')
+    }
+
+    if (!isOnline && canQueueOffline) {
+      try {
+        await queueCashierSale(payload, clientRequestId)
+      } catch (error) {
+        setDispenseError(error.message || 'Could not save this POS draft on the device.')
+      }
+      return
+    }
+
+    let saleResponse
+    try {
+      saleResponse = await apiRequest('/api/dispense/', {
+        method: 'POST',
+        body: payload,
+      })
+      payload.reference = saleResponse.sale?.reference || saleResponse.reference
     } catch (error) {
+      if (canQueueOffline && isNetworkError(error)) {
+        setIsOnline(false)
+        try {
+          await queueCashierSale(payload, clientRequestId)
+        } catch (queueError) {
+          setDispenseError(queueError.message || 'The server could not be reached and this POS draft could not be saved.')
+        }
+        return
+      }
       setPrescriptionRedirectSku(
         error.code === 'prescription_required' ? dispenseForm.sku : ''
       )
       setDispenseError(error.message || 'Could not record this dispensing.')
+      return
     }
+
+    try {
+      await refreshBranchData(activeBranchId)
+      setDataError('')
+    } catch (error) {
+      if (isNetworkError(error)) {
+        setIsOnline(false)
+        setWorkflowNotice('The sale was submitted successfully. Branch data could not be refreshed and may be stale until reconnection.')
+      } else {
+        setWorkflowError(error.message || 'The sale was submitted, but branch data could not be refreshed.')
+      }
+    }
+
+    setDispenseForm(emptyDispense)
+    setDispenseError('')
+    setPrescriptionRedirectSku('')
+    setShowDispenseForm(false)
+    setReceiptSaleId(transactionType === 'Sale' ? saleResponse?.sale?.id || '' : '')
+    setWorkflowNotice(
+      transactionType === 'Sale'
+        ? `Sale ${payload.reference} recorded and stock updated.${saleResponse?.receiptEmailQueued ? ' Receipt email queued.' : ''}`
+        : `Stock issue ${payload.reference} recorded.`,
+    )
   }
 
 
 
   function handleSupplierInvoiceChange(event) {
-    const { name, value } = event.target
-    setSupplierInvoiceForm((current) => ({ ...current, [name]: value }))
+    const { name } = event.target
+    const value = event.target.type === 'file'
+      ? event.target.files?.[0] || null
+      : event.target.value
+    setSupplierInvoiceForm((current) => {
+      if (name === 'purchaseOrderId' && value) {
+        const order = purchaseOrders.find((item) => String(item.id) === value)
+        if (order) {
+          return {
+            ...current,
+            purchaseOrderId: value,
+            supplier: String(order.supplierId),
+          }
+        }
+      }
+      return { ...current, [name]: value }
+    })
   }
 
   function handleSupplierPaymentChange(event) {
@@ -771,7 +1325,10 @@ function App() {
   async function handleSaveSupplierInvoice(event) {
     event.preventDefault()
 
-    const supplier = supplierInvoiceForm.supplier.trim()
+    const supplierRecord = suppliers.find(
+      (item) => String(item.id) === supplierInvoiceForm.supplier,
+    )
+    const supplier = supplierRecord?.name || ''
     const invoiceNumber = supplierInvoiceForm.invoiceNumber.trim()
     const invoiceAmount = Number(supplierInvoiceForm.invoiceAmount)
     const amountPaid = Number(supplierInvoiceForm.amountPaid)
@@ -796,18 +1353,28 @@ function App() {
     }
 
     try {
-      await saveBranchAction('/api/supplier-invoices/', {
-        supplier,
-        invoiceNumber,
-        invoiceAmount,
-        amountPaid,
-        dueDate: supplierInvoiceForm.dueDate,
-        purchaseOrderId: supplierInvoiceForm.purchaseOrderId || null,
-        method: 'Opening payment',
-      })
+      const invoiceData = new FormData()
+      invoiceData.set('supplier', supplier)
+      invoiceData.set('supplierId', String(supplierRecord.id))
+      invoiceData.set('invoiceNumber', invoiceNumber)
+      invoiceData.set('invoiceAmount', String(invoiceAmount))
+      invoiceData.set('amountPaid', String(amountPaid))
+      invoiceData.set('dueDate', supplierInvoiceForm.dueDate)
+      invoiceData.set('purchaseOrderId', supplierInvoiceForm.purchaseOrderId)
+      invoiceData.set('method', 'Opening payment')
+      if (supplierInvoiceForm.originalDocument) {
+        invoiceData.set('originalDocument', supplierInvoiceForm.originalDocument)
+      }
+      const response = await saveBranchAction('/api/supplier-invoices/', invoiceData)
       setSupplierInvoiceForm(emptySupplierInvoice)
+      if (supplierInvoiceDocumentRef.current) {
+        supplierInvoiceDocumentRef.current.value = ''
+      }
       setSupplierInvoiceError('')
       setShowSupplierInvoiceForm(false)
+      setWorkflowNotice(
+        `Supplier invoice ${response.invoice.reference} recorded. Keep the supplier's invoice number (${invoiceNumber}) for reconciliation.`,
+      )
     } catch (error) {
       setSupplierInvoiceError(error.message || 'Could not save the supplier invoice.')
     }
@@ -817,11 +1384,10 @@ function App() {
     event.preventDefault()
 
     const amount = Number(supplierPaymentForm.amount)
-    const reference = supplierPaymentForm.reference.trim()
     const invoice = supplierInvoices.find((item) => item.id === supplierPaymentForm.invoiceId)
 
-    if (!invoice || !supplierPaymentForm.method || !reference || !Number.isFinite(amount) || amount <= 0) {
-      setSupplierPaymentError('Select an invoice and enter a valid payment, method, and reference.')
+    if (!invoice || !supplierPaymentForm.method || !Number.isFinite(amount) || amount <= 0) {
+      setSupplierPaymentError('Select an invoice and enter a valid payment and method.')
       return
     }
 
@@ -832,14 +1398,14 @@ function App() {
     }
 
     try {
-      await saveBranchAction(`/api/supplier-invoices/${invoice.id}/payments/`, {
+      const response = await saveBranchAction(`/api/supplier-invoices/${invoice.id}/payments/`, {
         amount,
         method: supplierPaymentForm.method,
-        reference,
       })
       setSupplierPaymentForm(emptySupplierPayment)
       setSupplierPaymentError('')
       setShowSupplierPaymentForm(false)
+      setWorkflowNotice(`Supplier payment ${response.reference} recorded.`)
     } catch (error) {
       setSupplierPaymentError(error.message || 'Could not record the supplier payment.')
     }
@@ -865,10 +1431,9 @@ function App() {
     const sale = sales.find((item) => item.id === customerPaymentForm.saleId)
     const amount = Number(customerPaymentForm.amount)
     const method = customerPaymentForm.method
-    const reference = customerPaymentForm.reference.trim()
 
-    if (!sale || !method || !reference || !Number.isFinite(amount) || amount <= 0) {
-      setCustomerPaymentError('Select an outstanding sale and enter a valid payment, method, and reference.')
+    if (!sale || !method || !Number.isFinite(amount) || amount <= 0) {
+      setCustomerPaymentError('Select an outstanding sale and enter a valid payment and method.')
       return
     }
 
@@ -878,14 +1443,14 @@ function App() {
     }
 
     try {
-      await saveBranchAction(`/api/sales/${sale.id}/payments/`, {
+      const response = await saveBranchAction(`/api/sales/${sale.id}/payments/`, {
         amount,
         method,
-        reference,
       })
       setCustomerPaymentForm(emptyCustomerPayment)
       setCustomerPaymentError('')
       setShowCustomerPaymentForm(false)
+      setWorkflowNotice(`Customer payment ${response.reference} recorded.`)
     } catch (error) {
       setCustomerPaymentError(error.message || 'Could not record the customer payment.')
     }
@@ -923,18 +1488,16 @@ function App() {
     event.preventDefault()
 
     const countedQuantity = Number(stockCountForm.quantity)
-    const reference = stockCountForm.reference.trim()
     const reason = stockCountForm.reason
 
     if (
       !stockCountForm.batch ||
       !Number.isInteger(countedQuantity) ||
       countedQuantity < 0 ||
-      !reason ||
-      !reference
+      !reason
     ) {
       setStockCountError(
-        'Select a batch, enter a whole-number count of zero or more, and provide a reason and reference.'
+        'Select a batch, enter a whole-number count of zero or more, and provide a reason.'
       )
       return
     }
@@ -958,37 +1521,18 @@ function App() {
     }
 
     try {
-      await saveBranchAction('/api/stock-count/', {
+      const response = await saveBranchAction('/api/stock-count/', {
         batch: countedBatch.batch,
         quantity: countedQuantity,
         reason,
-        reference,
         witnessId: stockCountForm.witnessId || null,
       })
       setStockCountForm(emptyStockCount)
       setStockCountError('')
       setShowStockCountForm(false)
+      setWorkflowNotice(`Stock count adjustment ${response.reference} recorded.`)
     } catch (error) {
       setStockCountError(error.message || 'Could not save the stock count.')
-    }
-  }
-
-  async function handleBarcodeLookup(event) {
-    event.preventDefault()
-    setWorkflowError('')
-    try {
-      const { product } = await apiRequest(
-        `/api/barcode/lookup/?value=${encodeURIComponent(barcodeInput.trim())}`,
-      )
-      setSearchTerm(product.name)
-      if (product.isControlled || product.requiresPrescription) {
-        setWorkflowError(
-          `${product.name} requires the prescription workflow${product.isControlled ? ' and controlled-medicine witness' : ''}.`,
-        )
-      }
-      setBarcodeInput('')
-    } catch (error) {
-      setWorkflowError(error.message || 'Barcode lookup failed.')
     }
   }
 
@@ -1031,17 +1575,17 @@ function App() {
     const line = prescription.lines.find((item) => String(item.id) === lineId)
     setWorkflowError('')
     try {
-      await saveBranchAction(`/api/prescriptions/${prescription.id}/dispense/`, {
+      const response = await saveBranchAction(`/api/prescriptions/${prescription.id}/dispense/`, {
         branchId: Number(activeBranchId),
         lineId: Number(lineId),
         quantity: Number(prescriptionDispenseForm.quantity),
         amountReceived: Number(prescriptionDispenseForm.amountReceived),
         paymentMethod: prescriptionDispenseForm.paymentMethod,
-        reference: prescriptionDispenseForm.reference,
-        patientReference: prescription.patientReference,
         witnessId: prescriptionDispenseForm.witnessId || null,
       })
       setPrescriptionDispenseForm(emptyPrescriptionDispense)
+      setReceiptSaleId(response.sale.id)
+      setWorkflowNotice(`Prescription sale ${response.sale.reference} recorded.`)
     } catch (error) {
       setWorkflowError(error.message || `Could not dispense ${line?.name || 'prescription item'}.`)
     }
@@ -1051,7 +1595,7 @@ function App() {
     event.preventDefault()
     setWorkflowError('')
     try {
-      await saveBranchAction('/api/purchase-orders/create/', {
+      const response = await saveBranchAction('/api/purchase-orders/create/', {
         ...purchaseOrderForm,
         supplierId: Number(purchaseOrderForm.supplierId),
         branchId: Number(activeBranchId),
@@ -1062,9 +1606,21 @@ function App() {
         }],
       })
       setPurchaseOrderForm(emptyPurchaseOrder)
+      setWorkflowNotice(`Purchase order ${response.number} created.`)
     } catch (error) {
       setWorkflowError(error.message || 'Could not create purchase order.')
     }
+  }
+
+  function handleUseForecast(item) {
+    setPurchaseOrderForm({
+      supplierId: String(item.supplierId),
+      expectedDate: item.expectedDeliveryDate,
+      sku: item.sku,
+      quantity: String(item.suggestedOrderQuantity),
+      unitCost: String(item.unitCost),
+    })
+    setWorkflowNotice(`Forecast for ${item.sku} loaded into the purchase-order form. Review supplier, quantity, cost, and delivery date before submitting.`)
   }
 
   async function handleCreateReorderDraft(sku) {
@@ -1082,9 +1638,14 @@ function App() {
   async function handleSubmitPurchaseOrder(orderId) {
     setWorkflowError('')
     try {
-      await saveBranchAction(`/api/purchase-orders/${orderId}/submit/`, {
+      const response = await saveBranchAction(`/api/purchase-orders/${orderId}/submit/`, {
         branchId: Number(activeBranchId),
       })
+      if (response.emailQueued) {
+        setWorkflowNotice('Purchase order submitted; supplier email queued for delivery.')
+      } else {
+        setWorkflowNotice('Purchase order submitted. No supplier email is configured.')
+      }
     } catch (error) {
       setWorkflowError(error.message || 'Could not submit purchase order.')
     }
@@ -1115,10 +1676,9 @@ function App() {
     event.preventDefault()
     setWorkflowError('')
     try {
-      await saveBranchAction('/api/transfers/create/', {
+      const response = await saveBranchAction('/api/transfers/create/', {
         sourceBranchId: Number(activeBranchId),
         destinationBranchId: Number(transferForm.destinationBranchId),
-        reference: transferForm.reference,
         lines: [{
           sku: transferForm.sku,
           quantity: Number(transferForm.quantity),
@@ -1127,6 +1687,7 @@ function App() {
       })
       setTransferWitnessId(transferForm.witnessId)
       setTransferForm(emptyTransfer)
+      setWorkflowNotice(`Transfer ${response.reference} requested.`)
     } catch (error) {
       setWorkflowError(error.message || 'Could not request branch transfer.')
     }
@@ -1168,7 +1729,7 @@ function App() {
   async function handleAnalyticsExport() {
     try {
       const params = new URLSearchParams({
-        branchId: activeBranchId,
+        branchId: reportBranchId,
         start: reportStart,
         end: reportEnd,
       })
@@ -1191,32 +1752,44 @@ function App() {
     }
   }
 
+  async function handleRemoveOfflineDraft(draft) {
+    try {
+      await deleteOfflineDraft(draft.id)
+      setOfflineDrafts((drafts) => drafts.filter((item) => item.id !== draft.id))
+      setWorkflowNotice('Queued POS draft removed from this device.')
+    } catch (error) {
+      setWorkflowError(error.message || 'Could not remove the queued POS draft.')
+    }
+  }
+
+  async function handleRetryConnection() {
+    try {
+      const response = await fetch('/api/auth/me/', { credentials: 'include' })
+      if (!response.ok) {
+        setAuthError('The server is reachable, but your sign-in may have expired. Reconnect and sign in again.')
+        return
+      }
+      setIsOnline(true)
+      setDataError('')
+      setWorkflowError('')
+    } catch (error) {
+      setWorkflowNotice(error.message || 'The server is still unreachable. Your queued POS drafts remain on this device.')
+    }
+  }
+
   async function handleCreateProduct(event) {
     event.preventDefault()
     setWorkflowError('')
     try {
-      await apiRequest('/api/products/create/', {
+      const response = await apiRequest('/api/products/create/', {
         method: 'POST',
         body: productForm,
       })
       setProductForm(emptyProduct)
       await refreshBranchData()
+      setWorkflowNotice(`Product created with SKU ${response.sku}.`)
     } catch (error) {
       setWorkflowError(error.message || 'Could not create product.')
-    }
-  }
-
-  async function handleCreateBarcodeAlias(event) {
-    event.preventDefault()
-    setWorkflowError('')
-    try {
-      await apiRequest('/api/barcode/aliases/', {
-        method: 'POST',
-        body: barcodeAliasForm,
-      })
-      setBarcodeAliasForm(emptyBarcodeAlias)
-    } catch (error) {
-      setWorkflowError(error.message || 'Could not add barcode alias.')
     }
   }
 
@@ -1224,12 +1797,13 @@ function App() {
     event.preventDefault()
     setWorkflowError('')
     try {
-      await apiRequest('/api/suppliers/create/', {
+      const response = await apiRequest('/api/suppliers/create/', {
         method: 'POST',
         body: supplierForm,
       })
       setSupplierForm(emptySupplier)
       await refreshBranchData()
+      setWorkflowNotice(`Supplier ${response.reference} created.`)
     } catch (error) {
       setWorkflowError(error.message || 'Could not create supplier.')
     }
@@ -1255,11 +1829,11 @@ function App() {
   }
 
   const navPages = [
-    'Overview',
-    'Inventory',
-    ...(canClinical ? ['Prescriptions'] : []),
-    ...(canManageBranch ? ['Purchasing', 'Suppliers', 'Transfers', 'Reports'] : []),
-    ...(currentUser?.isStaff && !isCashier ? ['Administration'] : []),
+    ...(activeRole ? ['Overview', 'Inventory'] : []),
+    ...(isOnline && canClinical ? ['Prescriptions'] : []),
+    ...(isOnline && canManageBranch ? ['Purchasing', 'Suppliers', 'Transfers'] : []),
+    ...(isOnline && (canManageBranch || currentUser?.isSuperuser) ? ['Reports'] : []),
+    ...(isOnline && currentUser?.isStaff && (currentUser.isSuperuser || !isCashier) ? ['Administration'] : []),
   ]
 
   if (authLoading) {
@@ -1281,7 +1855,10 @@ function App() {
   }
 
   return (
-    <div className={`app-layout${isSidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+    <div
+      className={`app-layout${isSidebarCollapsed ? ' sidebar-collapsed' : ''}`}
+      data-theme={theme}
+    >
       <aside className="sidebar">
         <h2 className="sidebar-brand">Wellnest</h2>
 
@@ -1320,32 +1897,22 @@ function App() {
             {activePage === 'Overview' ? 'Pharmacy Inventory' : activePage}
           </h1>
           <div className="topbar-actions">
-            {branches.length > 0 && (
+            <span className={isOnline ? 'connection-status online' : 'connection-status offline'} role="status">
+              {isOnline ? 'Online' : 'Offline'}
+            </span>
+            {!isOnline && <button type="button" onClick={handleRetryConnection}>Retry connection</button>}
+            {activeBranchId && (
+              <span className="active-branch-label">
+                Branch: {branches.find((branch) => String(branch.id) === String(activeBranchId))?.name || 'Assigned branch'}
+              </span>
+            )}
+            {currentUser.isSuperuser && activePage === 'Reports' && branches.length > 1 && (
               <label className="branch-select">
-                Branch
+                Analytics branch
                 <select
-                  value={activeBranchId}
-                  onChange={(event) => {
-                    setDataError('')
-                    const nextBranchId = event.target.value
-                    const nextRole = currentUser.isSuperuser
-                      ? 'administrator'
-                      : currentUser.memberships.find(
-                          (membership) => String(membership.branchId) === String(nextBranchId),
-                        )?.role
-                    const nextCanClinical = ['pharmacist', 'branch_manager'].includes(nextRole)
-                    const nextCanManageBranch = currentUser.isSuperuser || nextRole === 'branch_manager'
-                    const managerOnlyPages = ['Purchasing', 'Suppliers', 'Transfers', 'Reports']
-                    if (
-                      (nextRole === 'cashier' && !['Overview', 'Inventory'].includes(activePage)) ||
-                      (!nextCanClinical && activePage === 'Prescriptions') ||
-                      (!nextCanManageBranch && managerOnlyPages.includes(activePage))
-                    ) {
-                      setActivePage('Overview')
-                    }
-                    setActiveBranchId(nextBranchId)
-                  }}
-                  aria-label="Active branch"
+                  value={analyticsBranchId}
+                  onChange={(event) => setAnalyticsBranchId(event.target.value)}
+                  aria-label="Analytics branch"
                 >
                   {branches.map((branch) => (
                     <option key={branch.id} value={branch.id}>
@@ -1355,12 +1922,38 @@ function App() {
                 </select>
               </label>
             )}
-            <span>
-              Signed in as {currentUser.firstName || currentUser.username}
-            </span>
-            <button type="button" onClick={handleLogout}>
-              Sign out
+            {currentUser.isSuperuser &&
+              activePage === 'Reports' &&
+              branches.length === 1 &&
+              String(activeBranchId) !== String(branches[0].id) && (
+                <span className="active-branch-label">
+                  Analytics branch: {branches[0].name}
+                </span>
+              )}
+            <button
+              className="theme-toggle"
+              type="button"
+              onClick={toggleTheme}
+              aria-pressed={theme === 'dark'}
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                {theme === 'dark' ? (
+                  <path d="M12 3v2m0 14v2m9-9h-2M5 12H3m15.36-6.36-1.42 1.42M7.06 16.94l-1.42 1.42m12.72 0-1.42-1.42M7.06 7.06 5.64 5.64M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z" />
+                ) : (
+                  <path d="M20.3 15.3A8.5 8.5 0 0 1 8.7 3.7 8.5 8.5 0 1 0 20.3 15.3Z" />
+                )}
+              </svg>
             </button>
+            <div className="account-actions">
+              <span className="signed-in-user">
+                Signed in as {currentUser.firstName || currentUser.username}
+              </span>
+              <button type="button" onClick={handleLogout}>
+                Sign out
+              </button>
+            </div>
             {authError && <span className="auth-error" role="alert">{authError}</span>}
           </div>
         </header>
@@ -1369,6 +1962,23 @@ function App() {
           {dataError && <p className="form-error" role="alert">{dataError}</p>}
           {workflowError && <p className="form-error" role="alert">{workflowError}</p>}
           {workflowNotice && <p role="status">{workflowNotice}</p>}
+          {receiptSaleId && (
+            <p>
+              <a
+                className="receipt-pdf-link"
+                href={`/api/sales/${receiptSaleId}/receipt.pdf`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open/print sale receipt (PDF)
+              </a>
+            </p>
+          )}
+          {!isOnline && (
+            <p className="offline-warning" role="status">
+              Showing cached inventory where available. Cashiers may queue ordinary POS drafts; stock, payment, prescription, controlled-medicine, and approval actions require a connection.
+            </p>
+          )}
           {!dataError && branches.length === 0 && (
             <p className="form-error" role="alert">
               No active branch is assigned to your account. Ask an administrator to assign one.
@@ -1379,9 +1989,8 @@ function App() {
           )}
           {activePage === 'Overview' && (
             <>
-              <h2>Good morning</h2>
+              <h2>{timeGreeting}</h2>
               <p>Here’s an overview of your pharmacy stock.</p>
-
               <div className="summary-cards">
                 <article className="summary-card">
                   <span>Total products</span>
@@ -1408,6 +2017,31 @@ function App() {
                   <strong>{expiredCount}</strong>
                 </article>
               </div>
+
+              {offlineDrafts.length > 0 && (
+                <section className="inventory-panel offline-queue">
+                  <div className="inventory-heading">
+                    <div>
+                      <h2>Queued POS drafts</h2>
+                      <p>These are not completed sales yet. The server validates and records each draft after reconnection; unresolved price or stock conflicts will need review.</p>
+                    </div>
+                  </div>
+                  <table>
+                    <thead><tr><th>Reference</th><th>Branch</th><th>Saved</th><th>Status</th><th>Action</th></tr></thead>
+                    <tbody>
+                      {offlineDrafts.map((draft) => (
+                        <tr key={draft.id}>
+                          <td>{draft.status === 'needs_review' ? 'Not recorded' : 'Assigned when synced'}</td>
+                          <td>{draft.branchId}</td>
+                          <td>{new Date(draft.createdAt).toLocaleString()}</td>
+                          <td>{draft.status === 'needs_review' ? `Needs review: ${draft.error}` : 'Waiting to sync'}</td>
+                          <td><button type="button" onClick={() => handleRemoveOfflineDraft(draft)}>Remove</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </section>
+              )}
 
               <section className="inventory-panel">
                 <div className="inventory-heading">
@@ -1482,18 +2116,6 @@ function App() {
                   <option value="Expired">Expired</option>
                 </select>
 
-                <form className="barcode-lookup" onSubmit={handleBarcodeLookup}>
-                  <input
-                    type="search"
-                    value={barcodeInput}
-                    onChange={(event) => setBarcodeInput(event.target.value)}
-                    placeholder="Scan barcode or enter SKU"
-                    aria-label="Scan barcode or enter SKU"
-                    required
-                  />
-                  <button type="submit">Find</button>
-                </form>
-
                 {canClinical && <button
                   type="button"
                   onClick={() => setShowAddForm((shown) => !shown)}
@@ -1503,10 +2125,23 @@ function App() {
 
                 <button
                   type="button"
-                  onClick={() => setShowDispenseForm((shown) => !shown)}
+                  onClick={() => toggleDispenseForm('Sale')}
                 >
-                  {showDispenseForm ? 'Close checkout form' : isCashier ? 'New checkout' : 'Dispense stock'}
+                  {showDispenseForm && dispenseForm.transactionType === 'Sale'
+                    ? 'Close sale'
+                    : 'New sale'}
                 </button>
+                {canClinical && (
+                  <button
+                    className="button-secondary"
+                    type="button"
+                    onClick={() => toggleDispenseForm('Non-sale issue')}
+                  >
+                    {showDispenseForm && dispenseForm.transactionType === 'Non-sale issue'
+                      ? 'Close stock issue'
+                      : 'Record stock issue'}
+                  </button>
+                )}
 
                 {canClinical && <button
                   type="button"
@@ -1529,7 +2164,7 @@ function App() {
                   </label>
 
                   <label>
-                    Medicine
+                    Product
                     <input
                       name="name"
                       value={newBatch.name}
@@ -1611,13 +2246,13 @@ function App() {
                   </label>
 
                   <label>
-                    Expiry date
+                    Expiry date (leave blank only when none is printed on the skincare package)
                     <input
                       name="expiry"
                       type="date"
                       value={newBatch.expiry}
                       onChange={handleFormChange}
-                      required
+                      required={selectedBatchProduct?.productType !== 'skin_care'}
                     />
                   </label>
 
@@ -1626,16 +2261,6 @@ function App() {
                     <input
                       name="supplier"
                       value={newBatch.supplier}
-                      onChange={handleFormChange}
-                      required
-                    />
-                  </label>
-
-                  <label>
-                    Receipt / invoice reference
-                    <input
-                      name="reference"
-                      value={newBatch.reference}
                       onChange={handleFormChange}
                       required
                     />
@@ -1659,36 +2284,23 @@ function App() {
               {showDispenseForm && (
                 <form className="batch-form" onSubmit={handleDispense}>
                   <label>
-                    Medicine
+                    Product
                     <select
                       name="sku"
                       value={dispenseForm.sku}
                       onChange={handleDispenseFormChange}
                       required
                     >
-                      <option value="">Select medicine</option>
+                      <option value="">Select product</option>
                       {[
                         ...new Map(
                           inventory.map((item) => [item.sku, item])
                         ).values(),
                       ].map((medicine) => (
                         <option key={medicine.sku} value={medicine.sku}>
-                          {medicine.name}
+                          {medicine.name}{medicine.brand ? ` · ${medicine.brand}` : ''} ({medicine.productType === 'skin_care' ? 'Skin care' : 'Medicine'})
                         </option>
                       ))}
-                    </select>
-                  </label>
-
-                  <label>
-                    Transaction type
-                    <select
-                      name="transactionType"
-                      value={dispenseForm.transactionType}
-                      onChange={handleDispenseFormChange}
-                      required
-                    >
-                      <option value="Sale">Sale</option>
-                      {canClinical && <option value="Non-sale issue">Non-sale issue</option>}
                     </select>
                   </label>
 
@@ -1705,30 +2317,21 @@ function App() {
                     />
                   </label>
 
-                  <label>
-                    Supplied to
-                    <input
-                      name="recipient"
-                      value={dispenseForm.recipient}
-                      onChange={handleDispenseFormChange}
-                      required
-                    />
-                  </label>
-
-                  <label>
-                    Sale / issue reference
-                    <input
-                      name="reference"
-                      value={dispenseForm.reference}
-                      onChange={handleDispenseFormChange}
-                      required
-                    />
-                  </label>
+                  {dispenseForm.transactionType !== 'Sale' && <>
+                    <label>
+                      Issued to / reason
+                      <input
+                        name="recipient"
+                        value={dispenseForm.recipient}
+                        onChange={handleDispenseFormChange}
+                        required
+                      />
+                    </label>
+                  </>}
 
 
                   {dispenseForm.transactionType === 'Sale' && (
                     <>
-                      {isCashier && <p role="note">Payment and stock changes are held until a pharmacist approves this checkout.</p>}
                       <label>
                         Amount received
                         <input
@@ -1738,9 +2341,13 @@ function App() {
                           step="0.01"
                           value={dispenseForm.amountReceived}
                           onChange={handleDispenseFormChange}
-                          required
                         />
                       </label>
+                      {estimatedSale && estimatedSale.remaining === 0 && (
+                        <p className="sale-total" role="status">
+                          Sale total: {estimatedSale.saleAmount.toLocaleString()}
+                        </p>
+                      )}
 
                       <label>
                         Payment method
@@ -1750,13 +2357,21 @@ function App() {
                           onChange={handleDispenseFormChange}
                           required
                         >
-                          <option value="">Select payment method</option>
                           <option value="Cash">Cash</option>
                           <option value="Mobile money">Mobile money</option>
                           <option value="Bank transfer">Bank transfer</option>
                           <option value="Card">Card</option>
                           <option value="Credit">Credit</option>
                         </select>
+                      </label>
+                      <label>
+                        Receipt email (optional)
+                        <input
+                          name="receiptEmail"
+                          type="email"
+                          value={dispenseForm.receiptEmail}
+                          onChange={handleDispenseFormChange}
+                        />
                       </label>
                     </>
                   )}
@@ -1785,7 +2400,7 @@ function App() {
                   )}
 
                   <button type="submit">
-                    {isCashier ? 'Submit for pharmacist approval' : 'Record dispensing'}
+                    {dispenseForm.transactionType === 'Sale' ? 'Complete sale' : 'Record stock issue'}
                   </button>
                 </form>
               )}
@@ -1842,17 +2457,6 @@ function App() {
                     </select>
                   </label>
 
-                  <label>
-                    Count / adjustment reference
-                    <input
-                      name="reference"
-                      value={stockCountForm.reference}
-                      onChange={handleStockCountFormChange}
-                      placeholder="For example: COUNT-2026-001"
-                      required
-                    />
-                  </label>
-
                   {selectedCountBatch?.isControlled && (
                     <label>Independent witness
                       <select name="witnessId" value={stockCountForm.witnessId} onChange={handleStockCountFormChange} required>
@@ -1874,13 +2478,14 @@ function App() {
                 <thead>
                   <tr>
                     <th>SKU</th>
-                    <th>Medicine</th>
+                    <th>Product</th>
+                    <th>Type</th>
                     <th>Batch</th>
                     <th>Category</th>
                     <th>Quantity</th>
-                    {canClinical && <th>Purchase cost / unit</th>}
+                    {canViewFinancials && <th>Purchase cost / unit</th>}
                     <th>Selling price / unit</th>
-                    {canClinical && <th>Gross profit / unit</th>}
+                    {canViewFinancials && <th>Gross profit / unit</th>}
                     <th>Expiry date</th>
                     <th>Status</th>
                   </tr>
@@ -1899,14 +2504,15 @@ function App() {
                     return (
                       <tr key={medicine.batch}>
                         <td>{medicine.sku}</td>
-                        <td>{medicine.name}</td>
+                        <td>{medicine.name}{medicine.brand ? ` · ${medicine.brand}` : ''}</td>
+                        <td>{medicine.productType === 'skin_care' ? 'Skin care' : 'Medicine'}</td>
                         <td>{medicine.batch}</td>
                         <td>{medicine.category}</td>
                         <td>{medicine.quantity}</td>
-                        {canClinical && <td>{Number(medicine.purchaseCost || 0).toLocaleString()}</td>}
+                        {canViewFinancials && <td>{Number(medicine.purchaseCost || 0).toLocaleString()}</td>}
                         <td>{Number(medicine.sellingPrice || 0).toLocaleString()}</td>
-                        {canClinical && <td>{(Number(medicine.sellingPrice || 0) - Number(medicine.purchaseCost || 0)).toLocaleString()}</td>}
-                        <td>{medicine.expiry}</td>
+                        {canViewFinancials && <td>{(Number(medicine.sellingPrice || 0) - Number(medicine.purchaseCost || 0)).toLocaleString()}</td>}
+                        <td>{medicine.expiry || 'No printed expiry'}</td>
                         <td>
                           <span className={`stock-status ${statusClass}`}>
                             {status}
@@ -1918,7 +2524,7 @@ function App() {
 
                   {filteredMedicines.length === 0 && (
                     <tr>
-                      <td colSpan={canClinical ? 10 : 8}>No matching batches found.</td>
+                      <td colSpan={canViewFinancials ? 11 : 9}>No matching batches found.</td>
                     </tr>
                   )}
                 </tbody>
@@ -1959,7 +2565,7 @@ function App() {
                   <label>Product
                     <select value={prescriptionForm.sku} onChange={(event) => setPrescriptionForm((current) => ({ ...current, sku: event.target.value }))} required>
                       <option value="">Select product</option>
-                      {products.map((product) => <option key={product.sku} value={product.sku}>{product.sku} — {product.name}{product.isControlled ? ' (controlled)' : product.requiresPrescription ? ' (prescription required)' : ''}</option>)}
+                      {products.filter((product) => product.productType !== 'skin_care').map((product) => <option key={product.sku} value={product.sku}>{product.sku} — {product.name}{product.isControlled ? ' (controlled)' : product.requiresPrescription ? ' (prescription required)' : ''}</option>)}
                     </select>
                   </label>
                   <label>Quantity prescribed
@@ -2009,7 +2615,7 @@ function App() {
                     </select>
                   </label>
                   <label>Dispense reference
-                    <input value={prescriptionDispenseForm.reference} onChange={(event) => setPrescriptionDispenseForm((current) => ({ ...current, reference: event.target.value }))} required />
+                    <span className="generated-reference-note">Generated automatically when the item is dispensed.</span>
                   </label>
                   {selectedPrescriptionLine?.isControlled && <label>Independent witness
                     <select value={prescriptionDispenseForm.witnessId} onChange={(event) => setPrescriptionDispenseForm((current) => ({ ...current, witnessId: event.target.value }))} required>
@@ -2027,6 +2633,50 @@ function App() {
           {activePage === 'Purchasing' && (
             <>
               {workflowError && <p className="form-error" role="alert">{workflowError}</p>}
+              <section className="inventory-panel forecast-panel">
+                <div className="inventory-heading">
+                  <div>
+                    <h2>Demand forecast assistant</h2>
+                    <p>Local, explainable forecast from approved sales. Recommendations are advisory; no orders are created or submitted automatically.</p>
+                  </div>
+                </div>
+                <p className="forecast-method">
+                  Uses a 56-day weighted moving average (recent 28 days weighted 70%), supplier lead time plus a 14-day review buffer, configured reorder levels, and estimated near-expiry surplus. Stockout days are not adjusted for, so review low-confidence results.
+                </p>
+                {replenishmentForecast && String(replenishmentForecast.branchId) === String(activeBranchId) ? (
+                  <table>
+                    <thead>
+                      <tr><th>Product</th><th>Demand/day</th><th>Confidence</th><th>Lead / horizon</th><th>Stock / target</th><th>Expiry exposure</th><th>Suggested order</th><th>Supplier</th><th>Why / action</th></tr>
+                    </thead>
+                    <tbody>
+                      {replenishmentForecast.recommendations.map((item) => (
+                        <tr key={item.sku}>
+                          <td>{item.sku} — {item.name}</td>
+                          <td>{item.averageDailyDemand} units<br />{item.salesDays}/{item.lookbackDays} sales days</td>
+                          <td><span className={`forecast-confidence ${item.confidence}`}>{item.confidence}</span><br />{item.confidenceReason}</td>
+                          <td>{item.leadTimeDays} / {item.forecastHorizonDays} days</td>
+                          <td>{item.effectiveStock} / {item.targetStock} units</td>
+                          <td>{item.expiringWithin30Days} units expiring; {item.estimatedExpiryRisk} estimated at risk</td>
+                          <td><strong>{item.suggestedOrderQuantity}</strong></td>
+                          <td>{item.supplier || 'Not configured'}</td>
+                          <td>
+                            <details>
+                              <summary>Reasoning</summary>
+                              <ul>{item.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                            </details>
+                            {item.suggestedOrderQuantity > 0 && item.supplierId && item.unitCost !== null
+                              ? <button type="button" onClick={() => handleUseForecast(item)}>Use in PO form</button>
+                              : item.suggestedOrderQuantity > 0 ? 'Configure a preferred supplier' : 'No order suggested'}
+                          </td>
+                        </tr>
+                      ))}
+                      {!replenishmentForecast.recommendations.length && (
+                        <tr><td colSpan="9">No active products with branch stock to forecast.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                ) : <p role="status">Loading forecast…</p>}
+              </section>
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Reorder recommendations</h2><p>Suggestions use unexpired on-hand quantities and configured batch reorder points.</p></div></div>
                 <table>
@@ -2043,8 +2693,7 @@ function App() {
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Purchase order</h2><p>Create and submit an order; only branch managers can create or receive orders.</p></div></div>
                 {canManageBranch ? <form className="batch-form" onSubmit={handleCreatePurchaseOrder}>
-                  <label>Order reference<input value={purchaseOrderForm.number} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, number: event.target.value }))} required /></label>
-                  <label>Supplier<select value={purchaseOrderForm.supplierId} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, supplierId: event.target.value }))} required><option value="">Select supplier</option>{suppliers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                  <label>Supplier<select value={purchaseOrderForm.supplierId} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, supplierId: event.target.value }))} required><option value="">Select supplier</option>{suppliers.map((item) => <option key={item.id} value={item.id}>{item.reference} — {item.name}</option>)}</select></label>
                   <label>Expected date<input type="date" value={purchaseOrderForm.expectedDate} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, expectedDate: event.target.value }))} /></label>
                   <label>Product<select value={purchaseOrderForm.sku} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, sku: event.target.value }))} required><option value="">Select product</option>{products.map((item) => <option key={item.sku} value={item.sku}>{item.sku} — {item.name}</option>)}</select></label>
                   <label>Quantity<input type="number" min="1" step="1" value={purchaseOrderForm.quantity} onChange={(event) => setPurchaseOrderForm((current) => ({ ...current, quantity: event.target.value }))} required /></label>
@@ -2055,7 +2704,7 @@ function App() {
                   <h3>Receive against order {purchaseReceiptForm.orderId}</h3>
                   <label>Received quantity<input type="number" min="1" step="1" value={purchaseReceiptForm.quantity} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, quantity: event.target.value }))} required /></label>
                   <label>Lot number<input value={purchaseReceiptForm.batch} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, batch: event.target.value }))} required /></label>
-                  <label>Expiry date<input type="date" value={purchaseReceiptForm.expiry} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, expiry: event.target.value }))} required /></label>
+                  <label>Expiry date<input type="date" value={purchaseReceiptForm.expiry} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, expiry: event.target.value }))} required={selectedReceiptLine?.productType !== 'skin_care'} /></label>
                   <label>Retail price per unit<input type="number" min="0" step="0.01" value={purchaseReceiptForm.sellingPrice} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, sellingPrice: event.target.value }))} required /></label>
                   {selectedReceiptLine?.isControlled && <label>Independent witness<select value={purchaseReceiptForm.witnessId} onChange={(event) => setPurchaseReceiptForm((current) => ({ ...current, witnessId: event.target.value }))} required><option value="">Select witness</option>{branchStaff.filter((member) => member.id !== currentUser.id).map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
                   <button type="submit">Receive stock</button>
@@ -2078,8 +2727,7 @@ function App() {
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Request branch transfer</h2><p>Transfers require manager permissions at each branch. Stock moves on dispatch and is received into a destination lot.</p></div></div>
                 {canManageBranch ? <form className="batch-form" onSubmit={handleCreateTransfer}>
-                  <label>Destination branch<select value={transferForm.destinationBranchId} onChange={(event) => setTransferForm((current) => ({ ...current, destinationBranchId: event.target.value }))} required><option value="">Select branch</option>{branches.filter((item) => String(item.id) !== String(activeBranchId)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-                  <label>Reference<input value={transferForm.reference} onChange={(event) => setTransferForm((current) => ({ ...current, reference: event.target.value }))} required /></label>
+                  <label>Destination branch<select value={transferForm.destinationBranchId} onChange={(event) => setTransferForm((current) => ({ ...current, destinationBranchId: event.target.value }))} required><option value="">Select branch</option>{branches.filter((item) => String(item.id) !== String(activeBranchId) && currentUser.memberships.some((membership) => String(membership.branchId) === String(item.id))).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
                   <label>Product<select value={transferForm.sku} onChange={(event) => setTransferForm((current) => ({ ...current, sku: event.target.value }))} required><option value="">Select product</option>{products.map((item) => <option key={item.sku} value={item.sku}>{item.sku} — {item.name}</option>)}</select></label>
                   <label>Quantity<input type="number" min="1" step="1" value={transferForm.quantity} onChange={(event) => setTransferForm((current) => ({ ...current, quantity: event.target.value }))} required /></label>
                   {selectedTransferProduct?.isControlled && <label>Independent witness<select value={transferForm.witnessId} onChange={(event) => setTransferForm((current) => ({ ...current, witnessId: event.target.value }))} required><option value="">Select witness at dispatch</option>{branchStaff.filter((member) => member.id !== currentUser.id).map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
@@ -2129,12 +2777,16 @@ function App() {
 
                 {showSupplierInvoiceForm && canManageBranch && (
                   <form className="batch-form" onSubmit={handleSaveSupplierInvoice}>
-                    <label>Supplier<input name="supplier" value={supplierInvoiceForm.supplier} onChange={handleSupplierInvoiceChange} required /></label>
-                    <label>Invoice number<input name="invoiceNumber" value={supplierInvoiceForm.invoiceNumber} onChange={handleSupplierInvoiceChange} required /></label>
+                    <label>Supplier<select name="supplier" value={supplierInvoiceForm.supplier} onChange={handleSupplierInvoiceChange} required>
+                      <option value="">Select supplier from directory</option>
+                      {suppliers.map((item) => <option key={item.id} value={item.id}>{item.reference} — {item.name}</option>)}
+                    </select></label>
+                    <label>Supplier's invoice number<input name="invoiceNumber" value={supplierInvoiceForm.invoiceNumber} onChange={handleSupplierInvoiceChange} required /></label>
                     <label>Invoice total<input name="invoiceAmount" type="number" min="0.01" step="0.01" value={supplierInvoiceForm.invoiceAmount} onChange={handleSupplierInvoiceChange} required /></label>
                     <label>Amount already paid<input name="amountPaid" type="number" min="0" step="0.01" value={supplierInvoiceForm.amountPaid} onChange={handleSupplierInvoiceChange} required /></label>
                     <label>Due date<input name="dueDate" type="date" value={supplierInvoiceForm.dueDate} onChange={handleSupplierInvoiceChange} required /></label>
                     <label>Linked purchase order (optional)<select name="purchaseOrderId" value={supplierInvoiceForm.purchaseOrderId} onChange={handleSupplierInvoiceChange}><option value="">No linked order</option>{purchaseOrders.map((order) => <option key={order.id} value={order.id}>{order.number} — {order.supplier} ({order.status})</option>)}</select></label>
+                    <label>Original supplier invoice (PDF, max 10 MB)<input ref={supplierInvoiceDocumentRef} name="originalDocument" type="file" accept="application/pdf,.pdf" onChange={handleSupplierInvoiceChange} /></label>
                     {supplierInvoiceError && <p className="form-error">{supplierInvoiceError}</p>}
                     <button type="submit">Save invoice</button>
                   </form>
@@ -2145,35 +2797,39 @@ function App() {
                     <label>Invoice<select name="invoiceId" value={supplierPaymentForm.invoiceId} onChange={handleSupplierPaymentChange} required>
                       <option value="">Select an unpaid invoice</option>
                       {supplierInvoices.filter((invoice) => invoice.invoiceAmount > invoice.amountPaid).map((invoice) => (
-                        <option key={invoice.id} value={invoice.id}>{invoice.supplier} — {invoice.invoiceNumber} — balance {((invoice.invoiceAmount - invoice.amountPaid).toLocaleString())}</option>
+                        <option key={invoice.id} value={invoice.id}>{invoice.reference} — {invoice.supplier} — invoice {invoice.invoiceNumber} — balance {((invoice.invoiceAmount - invoice.amountPaid).toLocaleString())}</option>
                       ))}
                     </select></label>
                     <label>Payment amount<input name="amount" type="number" min="0.01" step="0.01" value={supplierPaymentForm.amount} onChange={handleSupplierPaymentChange} required /></label>
                     <label>Payment method<select name="method" value={supplierPaymentForm.method} onChange={handleSupplierPaymentChange} required>
                       <option value="">Select method</option><option value="Cash">Cash</option><option value="Mobile money">Mobile money</option><option value="Bank transfer">Bank transfer</option><option value="Card">Card</option>
                     </select></label>
-                    <label>Payment reference<input name="reference" value={supplierPaymentForm.reference} onChange={handleSupplierPaymentChange} required /></label>
+                    <p className="generated-reference-note">A payment reference will be generated automatically.</p>
                     {supplierPaymentError && <p className="form-error">{supplierPaymentError}</p>}
                     <button type="submit">Save payment</button>
                   </form>
                 )}
 
                 <table>
-                  <thead><tr><th>Supplier</th><th>Invoice</th><th>Invoice total</th><th>Paid</th><th>Balance</th><th>Due date</th><th>Payment status</th><th>Reconciliation</th><th>Action</th></tr></thead>
+                  <thead><tr><th>Supplier</th><th>System reference</th><th>Supplier invoice</th><th>Invoice total</th><th>Paid</th><th>Balance</th><th>Due date</th><th>Payment status</th><th>Reconciliation</th><th>Action</th><th>Documents</th></tr></thead>
                   <tbody>
                     {supplierInvoices.map((invoice) => {
                       const balance = invoice.invoiceAmount - invoice.amountPaid
                       const status = getSupplierInvoiceStatus(invoice)
                       const linkedOrder = purchaseOrders.find((order) => String(order.id) === String(invoice.purchaseOrderId))
                       return <tr key={invoice.id}>
-                        <td>{invoice.supplier}</td><td>{invoice.invoiceNumber}</td>
+                        <td>{invoice.supplier}</td><td>{invoice.reference}</td><td>{invoice.invoiceNumber}</td>
                         <td>{invoice.invoiceAmount.toLocaleString()}</td><td>{invoice.amountPaid.toLocaleString()}</td>
                         <td>{balance.toLocaleString()}</td><td>{invoice.dueDate}</td><td>{status}</td>
                         <td>{invoice.purchaseOrderId ? `${invoice.reconciliationStatus}${invoice.reconciledExpectedAmount !== null ? ` · expected ${invoice.reconciledExpectedAmount.toLocaleString()} · variance ${invoice.reconciliationVariance.toLocaleString()}` : ''}` : 'Not linked to an order'}</td>
                         <td>{canManageBranch && linkedOrder?.status === 'received' && <button type="button" onClick={() => handleReconcileSupplierInvoice(invoice.id)}>Reconcile</button>}</td>
+                        <td>
+                          <a href={`/api/supplier-invoices/${invoice.id}/reconciliation.pdf`} target="_blank" rel="noopener noreferrer">Reconciliation PDF</a>
+                          {invoice.hasOriginalDocument && <> · <a href={`/api/supplier-invoices/${invoice.id}/original/`}>Original PDF</a></>}
+                        </td>
                       </tr>
                     })}
-                    {supplierInvoices.length === 0 && <tr><td colSpan="9">No supplier invoices recorded yet.</td></tr>}
+                    {supplierInvoices.length === 0 && <tr><td colSpan="11">No supplier invoices recorded yet.</td></tr>}
                   </tbody>
                 </table>
               </section>
@@ -2181,12 +2837,12 @@ function App() {
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Supplier payment history</h2><p>Payments entered against supplier invoices.</p></div></div>
                 <table>
-                  <thead><tr><th>Date</th><th>Supplier</th><th>Invoice</th><th>Amount</th><th>Method</th><th>Reference</th></tr></thead>
+                  <thead><tr><th>Date</th><th>Supplier</th><th>System invoice</th><th>Supplier invoice</th><th>Amount</th><th>Method</th><th>Payment reference</th></tr></thead>
                   <tbody>
                     {supplierPayments.map((payment) => <tr key={payment.id}>
-                      <td>{new Date(payment.recordedAt).toLocaleString()}</td><td>{payment.supplier}</td><td>{payment.invoiceNumber}</td><td>{payment.amount.toLocaleString()}</td><td>{payment.method}</td><td>{payment.reference}</td>
+                      <td>{new Date(payment.recordedAt).toLocaleString()}</td><td>{payment.supplier}</td><td>{payment.invoiceReference}</td><td>{payment.invoiceNumber}</td><td>{payment.amount.toLocaleString()}</td><td>{payment.method}</td><td>{payment.reference}</td>
                     </tr>)}
-                    {supplierPayments.length === 0 && <tr><td colSpan="6">No supplier payments recorded yet.</td></tr>}
+                    {supplierPayments.length === 0 && <tr><td colSpan="7">No supplier payments recorded yet.</td></tr>}
                   </tbody>
                 </table>
               </section>
@@ -2209,29 +2865,73 @@ function App() {
           {activePage === 'Administration' && currentUser.isStaff && (
             <>
               <section className="inventory-panel">
-                <div className="inventory-heading"><div><h2>Medication catalog</h2><p>Set the locally configured prescription and controlled flags; they block ordinary sales.</p></div></div>
+                <div className="inventory-heading"><div><h2>Product catalog</h2><p>Medicines and skincare share stock, purchasing, sales, and reporting. Expiry is required for medicines; record the skincare package date when provided, and keep period-after-opening separate. A unique SKU is assigned automatically.</p></div></div>
                 <form className="batch-form" onSubmit={handleCreateProduct}>
-                  <label>SKU<input value={productForm.sku} onChange={(event) => setProductForm((current) => ({ ...current, sku: event.target.value }))} required /></label>
                   <label>Name<input value={productForm.name} onChange={(event) => setProductForm((current) => ({ ...current, name: event.target.value }))} required /></label>
                   <label>Category<input value={productForm.category} onChange={(event) => setProductForm((current) => ({ ...current, category: event.target.value }))} required /></label>
-                  <label>Dispensing unit<input value={productForm.unit} onChange={(event) => setProductForm((current) => ({ ...current, unit: event.target.value }))} required /></label>
-                  <label>Primary barcode<input value={productForm.barcode} onChange={(event) => setProductForm((current) => ({ ...current, barcode: event.target.value }))} /></label>
-                  <label className="checkbox-label"><input type="checkbox" checked={productForm.requiresPrescription} onChange={(event) => setProductForm((current) => ({ ...current, requiresPrescription: event.target.checked }))} /> Prescription required</label>
-                  <label className="checkbox-label"><input type="checkbox" checked={productForm.isControlled} onChange={(event) => setProductForm((current) => ({ ...current, isControlled: event.target.checked }))} /> Controlled medicine</label>
-                  <label>Controlled schedule (as configured)
-                    <input value={productForm.controlledSchedule} onChange={(event) => setProductForm((current) => ({ ...current, controlledSchedule: event.target.value }))} />
+                  <label>Product type
+                    <select value={productForm.productType} onChange={(event) => setProductForm((current) => ({
+                      ...current,
+                      productType: event.target.value,
+                      requiresPrescription: event.target.value === 'medicine' ? current.requiresPrescription : false,
+                      isControlled: event.target.value === 'medicine' ? current.isControlled : false,
+                      controlledSchedule: event.target.value === 'medicine' ? current.controlledSchedule : '',
+                      ...(event.target.value === 'medicine' ? {
+                        brand: '',
+                        skinType: '',
+                        skinConcerns: '',
+                        keyIngredients: '',
+                        usageInstructions: '',
+                        warnings: '',
+                        periodAfterOpeningMonths: '',
+                      } : {}),
+                    }))}>
+                      <option value="medicine">Medicine</option>
+                      <option value="skin_care">Skin care</option>
+                    </select>
                   </label>
+                  <label>Dispensing unit<input value={productForm.unit} onChange={(event) => setProductForm((current) => ({ ...current, unit: event.target.value }))} required /></label>
+                  {productForm.productType === 'skin_care' ? <>
+                    <label>Brand<input value={productForm.brand} onChange={(event) => setProductForm((current) => ({ ...current, brand: event.target.value }))} /></label>
+                    <label>Skin type<input value={productForm.skinType} onChange={(event) => setProductForm((current) => ({ ...current, skinType: event.target.value }))} placeholder="For example: dry, oily, sensitive" /></label>
+                    <label>Skin concerns<input value={productForm.skinConcerns} onChange={(event) => setProductForm((current) => ({ ...current, skinConcerns: event.target.value }))} placeholder="For example: dryness, sun protection" /></label>
+                    <label>Key ingredients<textarea value={productForm.keyIngredients} onChange={(event) => setProductForm((current) => ({ ...current, keyIngredients: event.target.value }))} /></label>
+                    <label>Label usage instructions<textarea value={productForm.usageInstructions} onChange={(event) => setProductForm((current) => ({ ...current, usageInstructions: event.target.value }))} /></label>
+                    <label>Label warnings / allergens<textarea value={productForm.warnings} onChange={(event) => setProductForm((current) => ({ ...current, warnings: event.target.value }))} /></label>
+                    <label>Period after opening (months)
+                      <input type="number" min="1" step="1" value={productForm.periodAfterOpeningMonths} onChange={(event) => setProductForm((current) => ({ ...current, periodAfterOpeningMonths: event.target.value }))} />
+                    </label>
+                  </> : <>
+                    <label className="checkbox-label"><input type="checkbox" checked={productForm.requiresPrescription} onChange={(event) => setProductForm((current) => ({ ...current, requiresPrescription: event.target.checked }))} /> Prescription required</label>
+                    <label className="checkbox-label"><input type="checkbox" checked={productForm.isControlled} onChange={(event) => setProductForm((current) => ({ ...current, isControlled: event.target.checked }))} /> Controlled medicine</label>
+                    <label>Controlled schedule (as configured)
+                      <input value={productForm.controlledSchedule} onChange={(event) => setProductForm((current) => ({ ...current, controlledSchedule: event.target.value }))} />
+                    </label>
+                  </>}
                   <button type="submit">Add catalog product</button>
                 </form>
-              </section>
-              <section className="inventory-panel">
-                <div className="inventory-heading"><div><h2>Barcode alias</h2><p>Assign alternate package barcodes to an existing product.</p></div></div>
-                <form className="batch-form" onSubmit={handleCreateBarcodeAlias}>
-                  <label>Product<select value={barcodeAliasForm.sku} onChange={(event) => setBarcodeAliasForm((current) => ({ ...current, sku: event.target.value }))} required><option value="">Select product</option>{products.map((item) => <option key={item.sku} value={item.sku}>{item.sku} — {item.name}</option>)}</select></label>
-                  <label>Barcode value<input value={barcodeAliasForm.value} onChange={(event) => setBarcodeAliasForm((current) => ({ ...current, value: event.target.value }))} required /></label>
-                  <label>Symbology (optional)<input value={barcodeAliasForm.symbology} onChange={(event) => setBarcodeAliasForm((current) => ({ ...current, symbology: event.target.value }))} /></label>
-                  <button type="submit">Add barcode alias</button>
-                </form>
+                <table>
+                  <thead><tr><th>SKU</th><th>Product</th><th>Type</th><th>Category</th><th>Brand</th><th>Skin-care label details</th></tr></thead>
+                  <tbody>{products.map((product) => <tr key={product.sku}>
+                    <td>{product.sku}</td>
+                    <td>{product.name}</td>
+                    <td>{product.productType === 'skin_care' ? 'Skin care' : 'Medicine'}</td>
+                    <td>{product.category}</td>
+                    <td>{product.brand || '—'}</td>
+                    <td>{product.productType === 'skin_care' ? <>
+                      {[product.skinType, product.skinConcerns].filter(Boolean).join(' · ') || '—'}
+                      {product.periodAfterOpeningMonths && <p>PAO: {product.periodAfterOpeningMonths} months after opening</p>}
+                      {(product.keyIngredients || product.usageInstructions || product.warnings) && <details>
+                        <summary>Ingredients and label guidance</summary>
+                        {product.keyIngredients && <p><strong>Ingredients:</strong> {product.keyIngredients}</p>}
+                        {product.usageInstructions && <p><strong>Usage:</strong> {product.usageInstructions}</p>}
+                        {product.warnings && <p><strong>Warnings:</strong> {product.warnings}</p>}
+                      </details>}
+                    </> : '—'}</td>
+                  </tr>)}
+                    {!products.length && <tr><td colSpan="6">No catalog products yet.</td></tr>}
+                  </tbody>
+                </table>
               </section>
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Supplier directory</h2><p>Maintain suppliers for purchase orders.</p></div></div>
@@ -2243,12 +2943,26 @@ function App() {
                   <label>Address<input value={supplierForm.address} onChange={(event) => setSupplierForm((current) => ({ ...current, address: event.target.value }))} /></label>
                   <button type="submit">Add supplier</button>
                 </form>
+                <table>
+                  <thead><tr><th>Supplier code</th><th>Supplier</th><th>Phone</th><th>Email</th></tr></thead>
+                  <tbody>
+                    {suppliers.map((supplier) => (
+                      <tr key={supplier.id}>
+                        <td>{supplier.reference}</td>
+                        <td>{supplier.name}</td>
+                        <td>{supplier.phone || '—'}</td>
+                        <td>{supplier.email || '—'}</td>
+                      </tr>
+                    ))}
+                    {!suppliers.length && <tr><td colSpan="4">No suppliers recorded yet.</td></tr>}
+                  </tbody>
+                </table>
               </section>
               <section className="inventory-panel">
                 <div className="inventory-heading"><div><h2>Supplier product terms</h2><p>Configure supplier SKU, unit cost, lead time, and the preferred supplier used for reorder drafts.</p></div></div>
                 <form className="batch-form" onSubmit={handleSetSupplierProduct}>
                   <label>Product<select value={supplierProductForm.sku} onChange={(event) => setSupplierProductForm((current) => ({ ...current, sku: event.target.value }))} required><option value="">Select product</option>{products.map((item) => <option key={item.sku} value={item.sku}>{item.sku} — {item.name}</option>)}</select></label>
-                  <label>Supplier<select value={supplierProductForm.supplierId} onChange={(event) => setSupplierProductForm((current) => ({ ...current, supplierId: event.target.value }))} required><option value="">Select supplier</option>{suppliers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                  <label>Supplier<select value={supplierProductForm.supplierId} onChange={(event) => setSupplierProductForm((current) => ({ ...current, supplierId: event.target.value }))} required><option value="">Select supplier</option>{suppliers.map((item) => <option key={item.id} value={item.id}>{item.reference} — {item.name}</option>)}</select></label>
                   <label>Supplier SKU<input value={supplierProductForm.supplierSku} onChange={(event) => setSupplierProductForm((current) => ({ ...current, supplierSku: event.target.value }))} /></label>
                   <label>Unit cost<input type="number" min="0" step="0.01" value={supplierProductForm.unitCost} onChange={(event) => setSupplierProductForm((current) => ({ ...current, unitCost: event.target.value }))} required /></label>
                   <label>Lead time (days)<input type="number" min="0" step="1" value={supplierProductForm.leadTimeDays} onChange={(event) => setSupplierProductForm((current) => ({ ...current, leadTimeDays: event.target.value }))} required /></label>
@@ -2264,7 +2978,7 @@ function App() {
             <>
               <section className="inventory-panel">
                 <div className="inventory-heading">
-                  <div><h2>Operational analytics</h2><p>Movement and sales totals for the selected branch and date range. Values are operational summaries, not statutory reports.</p></div>
+                  <div><h2>Operational analytics</h2><p>Movement and sales totals for {branches.find((branch) => String(branch.id) === String(reportBranchId))?.name || 'the selected branch'} and the chosen date range. Values are operational summaries, not statutory reports.</p></div>
                   <button type="button" onClick={handleAnalyticsExport}>Export movement CSV</button>
                 </div>
                 <div className="report-filters">
@@ -2272,13 +2986,74 @@ function App() {
                   <label>To<input type="date" value={reportEnd} onChange={(event) => setReportEnd(event.target.value)} /></label>
                 </div>
                 {workflowError && <p className="form-error" role="alert">{workflowError}</p>}
-                {analytics && <>
-                  <div className="summary-cards">
+                {analytics &&
+                  String(analytics.branchId) === String(reportBranchId) &&
+                  analytics.period.start === reportStart &&
+                  analytics.period.end === reportEnd && <>
+                  <div className="summary-cards report-summary-cards">
                     <article className="summary-card"><span>Received units</span><strong>{analytics.summary.unitsReceived}</strong></article>
                     <article className="summary-card"><span>Issued units</span><strong>{analytics.summary.unitsIssued}</strong></article>
-                    <article className="summary-card"><span>Sales total</span><strong>{analytics.summary.salesAmount.toLocaleString()}</strong></article>
+                    <article className="summary-card">
+                      <span>Approved sales</span>
+                      <strong>{analytics.summary.salesAmount.toLocaleString()}</strong>
+                      <small className={`report-change ${(analytics.summary.salesChangePercent ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                        {analytics.summary.salesChangePercent === null
+                          ? 'No sales in the comparison period'
+                          : `${analytics.summary.salesChangePercent >= 0 ? '+' : ''}${analytics.summary.salesChangePercent.toFixed(1)}% vs previous period`}
+                      </small>
+                    </article>
                     <article className="summary-card"><span>Gross profit</span><strong>{analytics.summary.grossProfit.toLocaleString()}</strong></article>
-                    <article className="summary-card"><span>Open balances</span><strong>{analytics.summary.outstandingBalance.toLocaleString()}</strong></article>
+                    <article className="summary-card"><span>Approved open balance</span><strong>{analytics.summary.outstandingBalance.toLocaleString()}</strong></article>
+                    <article className="summary-card"><span>Pending approval</span><strong>{analytics.summary.pendingApprovalCount}</strong></article>
+                  </div>
+                  <div className="analytics-insights">
+                    <section className="analytics-insight">
+                      <h3>Daily sales trend</h3>
+                      <div className="trend-list">
+                        {analytics.salesTrend.slice(-14).map((day) => {
+                          const peak = Math.max(...analytics.salesTrend.map((item) => item.salesAmount), 1)
+                          return (
+                            <div className="trend-row" key={day.date}>
+                              <span>{new Date(`${day.date}T00:00:00`).toLocaleDateString()}</span>
+                              <div className="trend-track" aria-hidden="true">
+                                <div className="trend-bar" style={{ width: `${(day.salesAmount / peak) * 100}%` }} />
+                              </div>
+                              <strong>{day.salesAmount.toLocaleString()}</strong>
+                            </div>
+                          )
+                        })}
+                        {!analytics.salesTrend.some((day) => day.salesAmount > 0) && <p>No approved sales for this date range.</p>}
+                      </div>
+                    </section>
+                    <section className="analytics-insight">
+                      <h3>Top products by units sold</h3>
+                      <table>
+                        <thead><tr><th>Product</th><th>Units</th><th>Sales</th><th>Gross profit</th></tr></thead>
+                        <tbody>
+                          {analytics.topProducts.map((product) => (
+                            <tr key={product.sku}>
+                              <td>{product.product}</td>
+                              <td>{product.unitsSold}</td>
+                              <td>{product.salesAmount.toLocaleString()}</td>
+                              <td>{product.grossProfit.toLocaleString()}</td>
+                            </tr>
+                          ))}
+                          {!analytics.topProducts.length && <tr><td colSpan="4">No product sales for this date range.</td></tr>}
+                        </tbody>
+                      </table>
+                    </section>
+                    <section className="analytics-insight">
+                      <h3>Stock risks to review</h3>
+                      <p>{analytics.stockRisk.outOfStockLots} out-of-stock lots · {analytics.stockRisk.lowStockLots} low-stock lots · {analytics.stockRisk.expiringLots} lots expiring in 90 days</p>
+                      <p>{analytics.stockRisk.reorderProducts} products currently meet reorder thresholds.</p>
+                      {!isCrossBranchAnalytics && reorderSuggestions.length > 0 && (
+                        <ul>
+                          {reorderSuggestions.slice(0, 5).map((item) => (
+                            <li key={item.sku}>{item.name}: {item.onHand} on hand, suggested order {item.suggestedQuantity}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
                   </div>
                   <div className="inventory-heading"><div><h2>Controlled medicine register</h2><p>Witness entries associated with recorded controlled stock movements.</p></div></div>
                   <table><thead><tr><th>Date</th><th>Product</th><th>Lot</th><th>Movement</th><th>Quantity</th><th>Witness</th><th>Balance after</th><th>Reference</th></tr></thead><tbody>
@@ -2288,7 +3063,7 @@ function App() {
                 </>}
               </section>
 
-              <section className="inventory-panel movement-panel">
+              {!isCrossBranchAnalytics && <section className="inventory-panel movement-panel">
               <div className="inventory-heading">
                 <div>
                   <h2>Recent stock activity</h2>
@@ -2334,9 +3109,9 @@ function App() {
                   )}
                 </tbody>
               </table>
-            </section>
+            </section>}
 
-              <section className="inventory-panel">
+              {!isCrossBranchAnalytics && <section className="inventory-panel">
                 <div className="inventory-heading">
                   <div>
                     <h2>Sales and payments</h2>
@@ -2371,9 +3146,7 @@ function App() {
                         <option value="Card">Card</option>
                       </select>
                     </label>
-                    <label>Payment reference
-                      <input name="reference" value={customerPaymentForm.reference} onChange={handleCustomerPaymentChange} required />
-                    </label>
+                    <p className="generated-reference-note">A payment reference will be generated automatically.</p>
                     {customerPaymentError && <p className="form-error">{customerPaymentError}</p>}
                     <button type="submit">Save customer payment</button>
                   </form>
@@ -2386,7 +3159,7 @@ function App() {
                       <th>Medicine</th>
                       <th>Quantity</th>
                       <th>Sale total</th>
-                      {canClinical && <th>Gross profit</th>}
+                      {canViewFinancials && <th>Gross profit</th>}
                       <th>Received</th>
                       <th>Balance due</th>
                       <th>Approval</th>
@@ -2405,7 +3178,7 @@ function App() {
                         <td>{sale.name}</td>
                         <td>{sale.quantity}</td>
                         <td>{sale.saleAmount.toLocaleString()}</td>
-                        {canClinical && <td>{sale.grossProfit.toLocaleString()}</td>}
+                        {canViewFinancials && <td>{sale.grossProfit.toLocaleString()}</td>}
                         <td>{sale.amountReceived.toLocaleString()}</td>
                         <td>{sale.balanceDue.toLocaleString()}</td>
                         <td>{sale.approvalStatus}</td>
@@ -2431,13 +3204,13 @@ function App() {
                     ))}
                     {sales.length === 0 && (
                       <tr>
-                        <td colSpan={canClinical ? 14 : 13}>No sales recorded yet.</td>
+                        <td colSpan={canViewFinancials ? 14 : 13}>No sales recorded yet.</td>
                       </tr>
                     )}
                   </tbody>
                 </table>
-              </section>
-              <section className="inventory-panel">
+              </section>}
+              {!isCrossBranchAnalytics && <section className="inventory-panel">
                 <div className="inventory-heading">
                   <div>
                     <h2>Customer payment history</h2>
@@ -2471,7 +3244,7 @@ function App() {
                     )}
                   </tbody>
                 </table>
-              </section>
+              </section>}
 
             </>
           )}

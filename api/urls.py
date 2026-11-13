@@ -20,6 +20,16 @@ urlpatterns = [
     path("stock-count/", views.stock_count, name="stock-count"),
     path("supplier-invoices/", views.create_supplier_invoice, name="create-supplier-invoice"),
     path(
+        "supplier-invoices/<int:invoice_id>/reconciliation.pdf",
+        views.supplier_invoice_reconciliation_pdf,
+        name="supplier-invoice-reconciliation-pdf",
+    ),
+    path(
+        "supplier-invoices/<int:invoice_id>/original/",
+        views.supplier_invoice_original,
+        name="supplier-invoice-original",
+    ),
+    path(
         "supplier-invoices/<int:invoice_id>/payments/",
         views.supplier_payment,
         name="supplier-payment",
@@ -32,8 +42,7 @@ urlpatterns = [
     path("sales/<int:sale_id>/payments/", views.customer_payment, name="customer-payment"),
     path("sales/<int:sale_id>/approve/", views.approve_sale, name="approve-sale"),
     path("sales/<int:sale_id>/reject/", views.reject_sale, name="reject-sale"),
-    path("barcode/lookup/", views.barcode_lookup, name="barcode-lookup"),
-    path("barcode/aliases/", views.add_barcode_alias, name="barcode-alias"),
+    path("sales/<int:sale_id>/receipt.pdf", views.sale_receipt_pdf, name="sale-receipt-pdf"),
     path("prescriptions/", views.prescriptions_view, name="prescriptions"),
     path("prescriptions/create/", views.create_prescription, name="create-prescription"),
     path(
@@ -49,6 +58,7 @@ urlpatterns = [
     path("purchase-orders/", views.purchase_orders_view, name="purchase-orders"),
     path("purchase-orders/create/", views.create_purchase_order, name="create-purchase-order"),
     path("purchase-orders/reorder-draft/", views.create_reorder_draft, name="create-reorder-draft"),
+    path("reports/replenishment/", views.replenishment_forecast, name="replenishment-forecast"),
     path(
         "purchase-orders/<int:order_id>/submit/",
         views.submit_purchase_order,

@@ -230,29 +230,21 @@ if not DEBUG:
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-email_backend = (
+EMAIL_BACKEND = (
     "django.core.mail.backends.smtp.EmailBackend"
     if not DEBUG
     else "django.core.mail.backends.console.EmailBackend"
 )
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = _env_bool("EMAIL_USE_TLS", not DEBUG)
+EMAIL_USE_SSL = _env_bool("EMAIL_USE_SSL", False)
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "pharmacy@localhost")
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise ValueError("EMAIL_USE_TLS and EMAIL_USE_SSL cannot both be enabled.")
 
-email_options = {}
-if email_backend == "django.core.mail.backends.smtp.EmailBackend":
-    email_options = {
-        "host": os.environ.get("EMAIL_HOST", ""),
-        "port": int(os.environ.get("EMAIL_PORT", "587")),
-        "username": os.environ.get("EMAIL_HOST_USER", ""),
-        "password": os.environ.get("EMAIL_HOST_PASSWORD", ""),
-        "use_tls": _env_bool("EMAIL_USE_TLS", not DEBUG),
-        "use_ssl": _env_bool("EMAIL_USE_SSL", False),
-        "timeout": int(os.environ.get("EMAIL_TIMEOUT", "10")),
-    }
-    if email_options["use_tls"] and email_options["use_ssl"]:
-        raise ValueError("EMAIL_USE_TLS and EMAIL_USE_SSL cannot both be enabled.")
-
-MAILERS = {
-    "default": {
-        "BACKEND": email_backend,
-        "OPTIONS": email_options,
-    },
-}
+# Supplier originals are private and are only served by permission-checked views.
+MEDIA_ROOT = BASE_DIR / "private_uploads"

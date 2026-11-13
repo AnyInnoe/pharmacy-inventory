@@ -28,6 +28,19 @@ React and Vite dashboard for the Django pharmacy inventory API.
 
    Vite proxies `/api` requests to `http://127.0.0.1:8000`.
 
+   ## Offline behavior
+
+   The production frontend caches its app shell. After signing in and loading a
+   branch while connected, the same browser session can view cached inventory and
+   catalog data if the connection drops. Cashiers can queue ordinary POS sale
+   drafts on the device; drafts sync with the server when reconnected and still
+   require pharmacist or manager approval. They do not reserve stock or record
+   payments. Stock adjustments, approvals, prescriptions, and controlled-medicine
+   dispensing remain online-only. Offline drafts contain sale details, so use only
+   on access-controlled pharmacy devices; do not use shared/public browser
+   profiles. The browser's connectivity indicator is not a guarantee that the
+   backend is available; use “Retry connection” to test it.
+
 ## Validation
 
 Run `npm.cmd run lint` and `npm.cmd run build` from this directory. Run backend

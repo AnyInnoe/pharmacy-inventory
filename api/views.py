@@ -1,17 +1,24 @@
 import csv
 import json
+import math
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.contrib.auth import authenticate, login, logout
+from django.core.exceptions import ValidationError
+from django.core.validators import EmailValidator
 from django.db import models, transaction
-from django.http import HttpResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
+from .documents import (
+    invoice_reconciliation_pdf,
+    sale_receipt_pdf as render_sale_receipt_pdf,
+)
 from .models import (
     AuditEvent,
     Branch,
@@ -19,10 +26,10 @@ from .models import (
     BranchTransfer,
     BranchTransferLine,
     BranchMembership,
-    BarcodeAlias,
     ControlledDrugRegisterEntry,
     CustomerPayment,
     DispenseLine,
+    EmailNotification,
     ExternalIntegrationEvent,
     MedicineBatch,
     MedicationProduct,
@@ -91,7 +98,19 @@ def _json_body(request):
     return data, None
 
 
-def _branch_for_user(request, branch_id):
+def _generated_reference(prefix, record_id):
+    record_part = f"{record_id:06d}" if isinstance(record_id, int) else str(record_id)
+    return f"{prefix}-{timezone.localdate():%Y%m%d}-{record_part}"
+
+
+def _create_payment(payment_model, prefix, **values):
+    payment = payment_model.objects.create(reference="", **values)
+    payment.reference = _generated_reference(prefix, payment.pk)
+    payment.save(update_fields=["reference"])
+    return payment
+
+
+def _branch_for_user(request, branch_id, allow_admin_cross_branch=False):
     if not request.user.is_authenticated:
         return None, JsonResponse({"detail": "Authentication required."}, status=401)
     try:
@@ -99,18 +118,19 @@ def _branch_for_user(request, branch_id):
     except (Branch.DoesNotExist, ValueError, TypeError):
         return None, JsonResponse({"detail": "Select a valid active branch."}, status=400)
 
-    if not request.user.is_superuser and not BranchMembership.objects.filter(
+    has_membership = BranchMembership.objects.filter(
         user=request.user,
         branch=branch,
         is_active=True,
-    ).exists():
+    ).exists()
+    if not has_membership and not (
+        request.user.is_superuser and allow_admin_cross_branch
+    ):
         return None, JsonResponse({"detail": "You do not have access to this branch."}, status=403)
     return branch, None
 
 
 def _branch_role(request, branch):
-    if request.user.is_superuser:
-        return "administrator"
     membership = BranchMembership.objects.filter(
         user=request.user,
         branch=branch,
@@ -120,8 +140,6 @@ def _branch_role(request, branch):
 
 
 def _require_roles(request, branch, roles):
-    if request.user.is_superuser:
-        return None
     role = _branch_role(request, branch)
     if role not in roles:
         return JsonResponse({"detail": "You do not have permission for this action."}, status=403)
@@ -146,13 +164,19 @@ def _require_pharmacist(request, branch):
 
 
 def _branch_role_for_user(request, branch):
-    if request.user.is_superuser:
-        return "administrator"
     return BranchMembership.objects.filter(
         user=request.user,
         branch=branch,
         is_active=True,
     ).values_list("role", flat=True).first()
+
+
+def _can_view_financials(request, branch):
+    return (
+        request.user.is_superuser
+        or _branch_role_for_user(request, branch)
+        == BranchMembership.Role.BRANCH_MANAGER
+    )
 
 
 def _require_catalog_admin(request):
@@ -226,6 +250,23 @@ def _whole_number(value, field):
     raise ValueError(f"{field} must be a whole number.")
 
 
+def _batch_expiry(value, product_type):
+    expiry_value = str(value or "").strip()
+    if not expiry_value:
+        if product_type == MedicationProduct.ProductType.SKIN_CARE:
+            return None
+        raise ValueError("Expiry date is required for medicines.")
+    return date.fromisoformat(expiry_value)
+
+
+def _eligible_batch_expiry(as_of=None):
+    as_of = as_of or date.today()
+    return models.Q(expiry__gte=as_of) | models.Q(
+        product__product_type=MedicationProduct.ProductType.SKIN_CARE,
+        expiry__isnull=True,
+    )
+
+
 def _record_audit(request, branch, action, entity_type, entity_id, after=None, reference=""):
     AuditEvent.objects.create(
         actor=request.user,
@@ -261,23 +302,42 @@ def _queue_pos_event(sale):
     )
 
 
+def _queue_email_notification(event_key, notification_type, recipient, subject, body):
+    return EmailNotification.objects.get_or_create(
+        event_key=event_key,
+        defaults={
+            "notification_type": notification_type,
+            "recipient_email": recipient,
+            "subject": subject,
+            "body": body,
+        },
+    )
+
+
 def _batch_data(batch, include_cost=True):
     data = {
         "id": batch.id,
         "sku": batch.product.sku,
         "name": batch.product.name,
         "category": batch.product.category,
+        "productType": batch.product.product_type,
+        "brand": batch.product.brand,
+        "skinType": batch.product.skin_type,
+        "skinConcerns": batch.product.skin_concerns,
+        "keyIngredients": batch.product.key_ingredients,
+        "usageInstructions": batch.product.usage_instructions,
+        "warnings": batch.product.warnings,
+        "periodAfterOpeningMonths": batch.product.period_after_opening_months,
         "batch": batch.batch,
         "quantity": batch.quantity,
         "reorderLevel": batch.reorder_level,
-        "expiry": batch.expiry.isoformat(),
+        "expiry": batch.expiry.isoformat() if batch.expiry else None,
         "supplier": batch.supplier,
         "reference": batch.reference,
         "sellingPrice": float(batch.selling_price),
         "requiresPrescription": batch.product.requires_prescription,
         "isControlled": batch.product.is_controlled,
         "controlledSchedule": batch.product.controlled_schedule,
-        "barcode": batch.product.barcode,
     }
     if include_cost:
         data["purchaseCost"] = float(batch.purchase_cost)
@@ -314,6 +374,7 @@ def _sale_data(sale, include_cost=True):
 def _invoice_data(invoice):
     return {
         "id": str(invoice.pk),
+        "reference": f"INV-{invoice.pk:06d}",
         "supplier": invoice.supplier,
         "invoiceNumber": invoice.invoice_number,
         "invoiceAmount": float(invoice.invoice_amount),
@@ -333,6 +394,7 @@ def _invoice_data(invoice):
             else None
         ),
         "reconciledAt": invoice.reconciled_at.isoformat() if invoice.reconciled_at else None,
+        "hasOriginalDocument": bool(invoice.original_document),
     }
 
 
@@ -391,8 +453,15 @@ def products_view(request):
                 "sku": product.sku,
                 "name": product.name,
                 "category": product.category,
+                "productType": product.product_type,
                 "unit": product.unit,
-                "barcode": product.barcode or "",
+                "brand": product.brand,
+                "skinType": product.skin_type,
+                "skinConcerns": product.skin_concerns,
+                "keyIngredients": product.key_ingredients,
+                "usageInstructions": product.usage_instructions,
+                "warnings": product.warnings,
+                "periodAfterOpeningMonths": product.period_after_opening_months,
                 "requiresPrescription": product.requires_prescription,
                 "isControlled": product.is_controlled,
                 "controlledSchedule": product.controlled_schedule,
@@ -415,27 +484,77 @@ def create_product(request):
     sku = str(data.get("sku", "")).strip()
     name = str(data.get("name", "")).strip()
     category = str(data.get("category", "")).strip()
-    barcode = str(data.get("barcode", "")).strip()
-    if not sku or not name or not category:
-        return JsonResponse({"detail": "SKU, product name, and category are required."}, status=400)
-    if MedicationProduct.objects.filter(sku__iexact=sku).exists():
+    product_type = str(
+        data.get("productType", MedicationProduct.ProductType.MEDICINE)
+    ).strip()
+    if not name or not category:
+        return JsonResponse({"detail": "Product name and category are required."}, status=400)
+    if product_type not in MedicationProduct.ProductType.values:
+        return JsonResponse({"detail": "Select a valid product type."}, status=400)
+    if sku and MedicationProduct.objects.filter(sku__iexact=sku).exists():
         return JsonResponse({"detail": "SKU is already in use."}, status=409)
-    if barcode and MedicationProduct.objects.filter(barcode__iexact=barcode).exists():
-        return JsonResponse({"detail": "Barcode is already in use."}, status=409)
     if not isinstance(data.get("requiresPrescription", False), bool) or not isinstance(
         data.get("isControlled", False), bool
     ):
         return JsonResponse({"detail": "Prescription and controlled flags must be booleans."}, status=400)
-    product = MedicationProduct.objects.create(
-        sku=sku,
-        name=name,
-        category=category,
-        unit=str(data.get("unit", "unit")).strip() or "unit",
-        barcode=barcode or None,
-        requires_prescription=bool(data.get("requiresPrescription")),
-        is_controlled=bool(data.get("isControlled")),
-        controlled_schedule=str(data.get("controlledSchedule", "")).strip(),
-    )
+    if product_type == MedicationProduct.ProductType.SKIN_CARE and (
+        data.get("requiresPrescription") or data.get("isControlled")
+    ):
+        return JsonResponse(
+            {"detail": "Skin-care products cannot be marked as prescription or controlled medicines."},
+            status=400,
+        )
+    try:
+        pao_value = data.get("periodAfterOpeningMonths")
+        period_after_opening_months = (
+            _whole_number(pao_value, "Period after opening")
+            if pao_value not in (None, "")
+            else None
+        )
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=400)
+    if period_after_opening_months is not None and period_after_opening_months <= 0:
+        return JsonResponse(
+            {"detail": "Period after opening must be a positive number of months."},
+            status=400,
+        )
+    if product_type != MedicationProduct.ProductType.SKIN_CARE and (
+        period_after_opening_months is not None
+        or any(
+            str(data.get(field, "")).strip()
+            for field in (
+                "brand",
+                "skinType",
+                "skinConcerns",
+                "keyIngredients",
+                "usageInstructions",
+                "warnings",
+            )
+        )
+    ):
+        return JsonResponse(
+            {"detail": "Skin-care details can only be set for skin-care products."},
+            status=400,
+        )
+    product_fields = {
+        "name": name,
+        "category": category,
+        "product_type": product_type,
+        "unit": str(data.get("unit", "unit")).strip() or "unit",
+        "brand": str(data.get("brand", "")).strip(),
+        "skin_type": str(data.get("skinType", "")).strip(),
+        "skin_concerns": str(data.get("skinConcerns", "")).strip(),
+        "key_ingredients": str(data.get("keyIngredients", "")).strip(),
+        "usage_instructions": str(data.get("usageInstructions", "")).strip(),
+        "warnings": str(data.get("warnings", "")).strip(),
+        "period_after_opening_months": period_after_opening_months,
+        "requires_prescription": bool(data.get("requiresPrescription")),
+        "is_controlled": bool(data.get("isControlled")),
+        "controlled_schedule": str(data.get("controlledSchedule", "")).strip(),
+    }
+    if sku:
+        product_fields["sku"] = sku
+    product = MedicationProduct.objects.create(**product_fields)
     return JsonResponse({"sku": product.sku}, status=201)
 
 
@@ -445,7 +564,13 @@ def suppliers_view(request):
         return JsonResponse({"detail": "Authentication required."}, status=401)
     return JsonResponse({
         "suppliers": [
-            {"id": supplier.id, "name": supplier.name, "phone": supplier.phone, "email": supplier.email}
+            {
+                "id": supplier.id,
+                "reference": f"SUP-{supplier.pk:06d}",
+                "name": supplier.name,
+                "phone": supplier.phone,
+                "email": supplier.email,
+            }
             for supplier in Supplier.objects.filter(is_active=True)
         ]
     })
@@ -475,7 +600,14 @@ def create_supplier(request):
     )
     if not created:
         return JsonResponse({"detail": "Supplier already exists."}, status=409)
-    return JsonResponse({"id": supplier.id, "name": supplier.name}, status=201)
+    return JsonResponse(
+        {
+            "id": supplier.id,
+            "reference": f"SUP-{supplier.pk:06d}",
+            "name": supplier.name,
+        },
+        status=201,
+    )
 
 
 @require_POST
@@ -523,8 +655,8 @@ def dashboard_data(request):
         return error
 
     role = _branch_role_for_user(request, branch)
-    can_manage_branch = role in {"branch_manager", "administrator"}
-    can_view_cost = role != BranchMembership.Role.CASHIER
+    can_manage_branch = role == BranchMembership.Role.BRANCH_MANAGER
+    can_view_cost = _can_view_financials(request, branch)
     batches = MedicineBatch.objects.filter(branch=branch)
     movements = StockMovement.objects.filter(branch=branch).select_related("batch")
     sales = Sale.objects.filter(branch=branch)
@@ -558,6 +690,7 @@ def dashboard_data(request):
             {
                 "id": payment.id,
                 "invoiceId": str(payment.invoice_id),
+                "invoiceReference": f"INV-{payment.invoice_id:06d}",
                 "supplier": payment.invoice.supplier,
                 "invoiceNumber": payment.invoice.invoice_number,
                 "amount": float(payment.amount),
@@ -599,7 +732,6 @@ def create_batch(request):
         reorder_level = _whole_number(data.get("reorderLevel"), "Reorder level")
         purchase_cost = _money(data.get("purchaseCost"), "Purchase cost")
         selling_price = _money(data.get("sellingPrice"), "Selling price")
-        expiry = date.fromisoformat(data.get("expiry", ""))
     except (ValueError, TypeError) as exc:
         return JsonResponse({"detail": str(exc) or "Enter valid batch values."}, status=400)
 
@@ -608,20 +740,45 @@ def create_batch(request):
     category = str(data.get("category", "")).strip()
     batch_number = str(data.get("batch", "")).strip()
     supplier = str(data.get("supplier", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    if not all([sku, name, category, batch_number, supplier, reference]):
+    if not all([sku, name, category, batch_number, supplier]):
         return JsonResponse({"detail": "Complete all required batch fields."}, status=400)
     if quantity < 0 or reorder_level < 0:
         return JsonResponse({"detail": "Quantity and reorder level cannot be negative."}, status=400)
+    requested_product_type = data.get("productType")
+    if requested_product_type is not None and requested_product_type not in MedicationProduct.ProductType.values:
+        return JsonResponse({"detail": "Select a valid product type."}, status=400)
+    existing_product = MedicationProduct.objects.filter(sku=sku).first()
+    if (
+        existing_product
+        and requested_product_type is not None
+        and requested_product_type != existing_product.product_type
+    ):
+        return JsonResponse({"detail": "The SKU already belongs to a different product type."}, status=400)
+    product_type = (
+        existing_product.product_type
+        if existing_product
+        else requested_product_type or MedicationProduct.ProductType.MEDICINE
+    )
+    try:
+        expiry = _batch_expiry(data.get("expiry"), product_type)
+    except (ValueError, TypeError) as exc:
+        return JsonResponse({"detail": str(exc) or "Enter a valid expiry date."}, status=400)
     if MedicineBatch.objects.filter(branch=branch, batch__iexact=batch_number).exists():
         return JsonResponse({"detail": "That batch number already exists in this branch."}, status=400)
 
     product, created = MedicationProduct.objects.get_or_create(
         sku=sku,
-        defaults={"name": name, "category": category},
+        defaults={
+            "name": name,
+            "category": category,
+            "product_type": product_type,
+        },
     )
     if not created and (
-        product.name != name or product.category != category or not product.is_active
+        product.name != name
+        or product.category != category
+        or product.product_type != product_type
+        or not product.is_active
     ):
         return JsonResponse(
             {"detail": "The SKU already belongs to a different or inactive product."},
@@ -644,17 +801,19 @@ def create_batch(request):
             reorder_level=reorder_level,
             expiry=expiry,
             supplier=supplier,
-            reference=reference,
+            reference="",
             purchase_cost=purchase_cost,
             selling_price=selling_price,
         )
+        batch.reference = _generated_reference("RCV", batch.pk)
+        batch.save(update_fields=["reference"])
         movement = StockMovement.objects.create(
             branch=branch,
             batch=batch,
             type=StockMovement.Type.RECEIVED,
             quantity=quantity,
             supplier=supplier,
-            reference=reference,
+            reference=batch.reference,
             actor=request.user,
         )
         if product.is_controlled:
@@ -664,7 +823,15 @@ def create_batch(request):
                 balance_after=batch.quantity,
                 notes="Stock receipt",
             )
-        _record_audit(request, branch, AuditEvent.Action.CREATED, "medicine_batch", batch.pk, _batch_data(batch), reference)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.CREATED,
+            "medicine_batch",
+            batch.pk,
+            _batch_data(batch),
+            batch.reference,
+        )
     return JsonResponse({"batch": _batch_data(batch)}, status=201)
 
 
@@ -681,16 +848,32 @@ def dispense_stock(request):
         return error
 
     sku = str(data.get("sku", "")).strip()
-    recipient = str(data.get("recipient", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    transaction_type = data.get("transactionType")
+    transaction_type = data.get("transactionType", "Sale")
+    receipt_email = str(data.get("receiptEmail", "")).strip()
+    if receipt_email:
+        try:
+            EmailValidator()(receipt_email)
+        except ValidationError:
+            return JsonResponse({"detail": "Enter a valid receipt email address."}, status=400)
+        if transaction_type != "Sale":
+            return JsonResponse({"detail": "Receipt email is only available for sales."}, status=400)
+    recipient = (
+        "Walk-in customer"
+        if transaction_type == "Sale"
+        else str(data.get("recipient", "")).strip()
+    )
     try:
         quantity = _whole_number(data.get("quantity"), "Quantity")
         amount_received = _money(data.get("amountReceived", 0), "Amount received")
     except (ValueError, TypeError) as exc:
         return JsonResponse({"detail": str(exc) or "Enter a valid quantity."}, status=400)
-    if quantity <= 0 or not all([sku, recipient, reference]):
-        return JsonResponse({"detail": "Enter a valid quantity, medicine, recipient, and reference."}, status=400)
+    if quantity <= 0 or not sku or (
+        transaction_type == "Non-sale issue" and not recipient
+    ):
+        return JsonResponse(
+            {"detail": "Enter a valid quantity and medicine; stock issues also require a recipient."},
+            status=400,
+        )
     if transaction_type not in ("Sale", "Non-sale issue"):
         return JsonResponse({"detail": "Select a valid transaction type."}, status=400)
     membership_role = BranchMembership.objects.filter(
@@ -698,6 +881,7 @@ def dispense_stock(request):
         branch=branch,
         is_active=True,
     ).values_list("role", flat=True).first()
+    can_view_cost = _can_view_financials(request, branch)
     if transaction_type == "Sale" and membership_role not in {
         BranchMembership.Role.CASHIER,
         BranchMembership.Role.PHARMACIST,
@@ -714,6 +898,55 @@ def dispense_stock(request):
     payment_method = str(data.get("paymentMethod", "")).strip()
     if transaction_type == "Sale" and not payment_method:
         return JsonResponse({"detail": "Select a payment method for the sale."}, status=400)
+    client_request_id = None
+    if data.get("clientRequestId") is not None:
+        try:
+            client_request_id = uuid.UUID(str(data["clientRequestId"]))
+        except (ValueError, TypeError, AttributeError):
+            return JsonResponse({"detail": "Client request ID must be a UUID."}, status=400)
+
+    def existing_client_sale_response():
+        if client_request_id is None:
+            return None
+        existing_sale = Sale.objects.filter(
+            branch=branch,
+            client_request_id=client_request_id,
+        ).first()
+        if existing_sale is None:
+            return None
+        if (
+            existing_sale.actor_id != request.user.id
+            or existing_sale.sku != sku
+            or existing_sale.quantity != quantity
+            or existing_sale.recipient != recipient
+            or existing_sale.approval_amount_received != amount_received
+            or existing_sale.approval_payment_method != payment_method
+        ):
+            return JsonResponse(
+                {"detail": "Client request ID was already used for a different sale."},
+                status=409,
+            )
+        return JsonResponse(
+            {
+                "sale": _sale_data(
+                    existing_sale,
+                    include_cost=can_view_cost,
+                ),
+                "duplicate": True,
+                "receiptEmailQueued": EmailNotification.objects.filter(
+                    event_key=f"sale-receipt-{existing_sale.pk}",
+                ).exists(),
+            },
+            status=(
+                202
+                if existing_sale.approval_status == Sale.ApprovalStatus.PENDING
+                else 200
+            ),
+        )
+
+    duplicate_response = existing_client_sale_response()
+    if duplicate_response:
+        return duplicate_response
 
     product = MedicationProduct.objects.filter(sku=sku, is_active=True).first()
     if product is None:
@@ -735,9 +968,13 @@ def dispense_stock(request):
         eligible = list(
             MedicineBatch.objects.select_for_update()
             .select_related("product")
-            .filter(branch=branch, product__sku=sku, quantity__gt=0, expiry__gte=date.today())
-            .order_by("expiry", "id")
+            .filter(branch=branch, product__sku=sku, quantity__gt=0)
+            .filter(_eligible_batch_expiry())
+            .order_by(models.F("expiry").asc(nulls_last=True), "id")
         )
+        duplicate_response = existing_client_sale_response()
+        if duplicate_response:
+            return duplicate_response
         available = sum(batch.quantity for batch in eligible)
         if quantity > available:
             return JsonResponse(
@@ -768,6 +1005,7 @@ def dispense_stock(request):
             )
 
         sale = None
+        reference = None
         if transaction_type == "Sale":
             is_cashier = membership_role == BranchMembership.Role.CASHIER
             sale = Sale.objects.create(
@@ -777,55 +1015,52 @@ def dispense_stock(request):
                 quantity=quantity,
                 sale_amount=sale_amount,
                 cost_amount=cost_amount,
-                amount_received=Decimal("0.00") if is_cashier else amount_received,
-                balance_due=sale_amount if is_cashier else sale_amount - amount_received,
-                payment_method="" if is_cashier else payment_method,
+                amount_received=amount_received,
+                balance_due=sale_amount - amount_received,
+                payment_method=payment_method,
                 recipient=recipient,
-                reference=reference,
+                reference="",
                 actor=request.user,
-                approval_status=(
-                    Sale.ApprovalStatus.PENDING
-                    if is_cashier
-                    else Sale.ApprovalStatus.APPROVED
-                ),
+                approval_status=Sale.ApprovalStatus.APPROVED,
                 approval_amount_received=amount_received,
                 approval_payment_method=payment_method,
+                client_request_id=client_request_id,
                 approved_by=None if is_cashier else request.user,
-                approved_at=None if is_cashier else timezone.now(),
+                approved_at=timezone.now(),
             )
-            if is_cashier:
-                _record_audit(
-                    request,
-                    branch,
-                    AuditEvent.Action.CREATED,
-                    "sale",
-                    sale.pk,
-                    _sale_data(sale, include_cost=False),
-                    reference,
-                )
-                return JsonResponse({"sale": _sale_data(sale, include_cost=False)}, status=202)
+            sale.reference = _generated_reference("SALE", sale.pk)
+            sale.save(update_fields=["reference"])
+            reference = sale.reference
             if amount_received > 0:
-                CustomerPayment.objects.create(
+                _create_payment(
+                    CustomerPayment,
+                    "PAY",
                     sale=sale,
                     amount=amount_received,
                     method=payment_method,
-                    reference=reference,
                     actor=request.user,
                 )
 
+        first_movement_id = None
         for batch, allocated in allocations:
             batch.quantity -= allocated
             batch.save(update_fields=["quantity", "updated_at"])
-            StockMovement.objects.create(
+            movement = StockMovement.objects.create(
                 branch=branch,
                 batch=batch,
                 type=transaction_type,
                 quantity=-allocated,
                 recipient=recipient,
-                reference=reference,
+                reference=reference or "",
                 actor=request.user,
                 sale=sale,
             )
+            if first_movement_id is None:
+                first_movement_id = movement.pk
+            if reference is None:
+                reference = _generated_reference("ISS", movement.pk)
+                movement.reference = reference
+                movement.save(update_fields=["reference"])
             if sale:
                 SaleLine.objects.create(
                     sale=sale,
@@ -846,7 +1081,36 @@ def dispense_stock(request):
                 reference,
             )
             _queue_pos_event(sale)
-    return JsonResponse({"sale": _sale_data(sale) if sale else None}, status=201)
+            if receipt_email:
+                _queue_email_notification(
+                    f"sale-receipt-{sale.pk}",
+                    EmailNotification.Type.SALE_RECEIPT,
+                    receipt_email,
+                    "Your pharmacy receipt is ready",
+                    (
+                        f"A sale was recorded at {branch.name}. "
+                        f"Receipt reference: {sale.reference}. "
+                        "This email intentionally contains no product, prescription, or patient details."
+                    ),
+                )
+        else:
+            _record_audit(
+                request,
+                branch,
+                AuditEvent.Action.STOCK_ADJUSTED,
+                "stock_issue",
+                first_movement_id,
+                {"sku": sku, "quantity": quantity, "recipient": recipient},
+                reference,
+            )
+    return JsonResponse(
+        {
+            "sale": _sale_data(sale, include_cost=can_view_cost) if sale else None,
+            "reference": reference if sale is None else sale.reference,
+            "receiptEmailQueued": bool(sale and receipt_email),
+        },
+        status=201,
+    )
 
 
 @require_POST
@@ -866,9 +1130,8 @@ def stock_count(request):
         return JsonResponse({"detail": "Enter a whole-number stock count."}, status=400)
     batch_number = str(data.get("batch", "")).strip()
     reason = str(data.get("reason", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    if counted_quantity < 0 or not all([batch_number, reason, reference]):
-        return JsonResponse({"detail": "Select a batch, count, reason, and reference."}, status=400)
+    if counted_quantity < 0 or not all([batch_number, reason]):
+        return JsonResponse({"detail": "Select a batch, count, and reason."}, status=400)
     with transaction.atomic():
         try:
             batch = MedicineBatch.objects.select_for_update().get(branch=branch, batch=batch_number)
@@ -893,9 +1156,11 @@ def stock_count(request):
             quantity=difference,
             recipient=reason,
             reason=reason,
-            reference=reference,
+            reference="",
             actor=request.user,
         )
+        movement.reference = _generated_reference("ADJ", movement.pk)
+        movement.save(update_fields=["reference"])
         if batch.product.is_controlled:
             ControlledDrugRegisterEntry.objects.create(
                 movement=movement,
@@ -910,23 +1175,41 @@ def stock_count(request):
             "medicine_batch",
             batch.pk,
             {"quantity": counted_quantity},
-            reference,
+            movement.reference,
         )
-    return JsonResponse({"quantity": counted_quantity, "previousQuantity": previous_quantity})
+    return JsonResponse({
+        "quantity": counted_quantity,
+        "previousQuantity": previous_quantity,
+        "reference": movement.reference,
+    })
 
 
 @require_POST
 def create_supplier_invoice(request):
-    data, error = _json_body(request)
-    if error:
-        return error
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        data, error = request.POST, None
+    else:
+        data, error = _json_body(request)
+        if error:
+            return error
     branch, error = _branch_for_user(request, _branch_id(request, data))
     if error:
         return error
     error = _require_roles(request, branch, {"branch_manager"})
     if error:
         return error
-    supplier = str(data.get("supplier", "")).strip()
+    supplier_record = None
+    if data.get("supplierId"):
+        try:
+            supplier_record = Supplier.objects.get(
+                pk=int(data["supplierId"]),
+                is_active=True,
+            )
+        except (Supplier.DoesNotExist, ValueError, TypeError):
+            return JsonResponse({"detail": "Select a valid active supplier."}, status=400)
+        supplier = supplier_record.name
+    else:
+        supplier = str(data.get("supplier", "")).strip()
     invoice_number = str(data.get("invoiceNumber", "")).strip()
     method = str(data.get("method", "Opening payment")).strip()
     try:
@@ -939,6 +1222,15 @@ def create_supplier_invoice(request):
         return JsonResponse({"detail": "Enter valid invoice details. Amount paid cannot exceed the invoice total."}, status=400)
     if SupplierInvoice.objects.filter(branch=branch, invoice_number__iexact=invoice_number).exists():
         return JsonResponse({"detail": "That invoice number has already been entered."}, status=400)
+    original_document = request.FILES.get("originalDocument")
+    if original_document:
+        if original_document.size > 10 * 1024 * 1024:
+            return JsonResponse({"detail": "Supplier invoice PDF must be 10 MB or smaller."}, status=400)
+        if not original_document.name.lower().endswith(".pdf"):
+            return JsonResponse({"detail": "Supplier invoice originals must be PDF files."}, status=400)
+        if original_document.read(5) != b"%PDF-":
+            return JsonResponse({"detail": "The uploaded supplier invoice is not a valid PDF."}, status=400)
+        original_document.seek(0)
     purchase_order = None
     if data.get("purchaseOrderId"):
         try:
@@ -948,30 +1240,131 @@ def create_supplier_invoice(request):
             )
         except (PurchaseOrder.DoesNotExist, ValueError, TypeError):
             return JsonResponse({"detail": "Purchase order does not belong to this branch."}, status=400)
-        if purchase_order.supplier.name.casefold() != supplier.casefold():
+        if (
+            purchase_order.supplier.name.casefold() != supplier.casefold()
+            or (
+                supplier_record
+                and purchase_order.supplier_id != supplier_record.pk
+            )
+        ):
             return JsonResponse({"detail": "Invoice supplier must match the linked purchase order."}, status=400)
     with transaction.atomic():
         invoice = SupplierInvoice.objects.create(
             branch=branch,
-            supplier_record=purchase_order.supplier if purchase_order else None,
+            supplier_record=(
+                supplier_record
+                or (purchase_order.supplier if purchase_order else None)
+            ),
             purchase_order=purchase_order,
             supplier=supplier,
             invoice_number=invoice_number,
             invoice_amount=invoice_amount,
             amount_paid=amount_paid,
             due_date=due_date,
+            original_document=original_document,
             actor=request.user,
         )
         if amount_paid > 0:
-            SupplierPayment.objects.create(
+            _create_payment(
+                SupplierPayment,
+                "SPAY",
                 invoice=invoice,
                 amount=amount_paid,
                 method=method,
-                reference=invoice_number,
                 actor=request.user,
             )
-        _record_audit(request, branch, AuditEvent.Action.CREATED, "supplier_invoice", invoice.pk, _invoice_data(invoice), invoice_number)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.CREATED,
+            "supplier_invoice",
+            invoice.pk,
+            _invoice_data(invoice),
+            f"INV-{invoice.pk:06d}",
+        )
     return JsonResponse({"invoice": _invoice_data(invoice)}, status=201)
+
+
+@require_GET
+def sale_receipt_pdf(request, sale_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({"detail": "Authentication required."}, status=401)
+    try:
+        sale = Sale.objects.select_related("branch", "actor").prefetch_related(
+            "lines__batch__product",
+        ).get(pk=sale_id)
+    except Sale.DoesNotExist:
+        return JsonResponse({"detail": "Sale not found."}, status=404)
+    branch, error = _branch_for_user(request, sale.branch_id)
+    if error:
+        return error
+    error = _require_roles(
+        request,
+        branch,
+        {"cashier", "pharmacist", "branch_manager"},
+    )
+    if error:
+        return error
+    if sale.approval_status != Sale.ApprovalStatus.APPROVED:
+        return JsonResponse({"detail": "A receipt is available only after the sale is approved."}, status=409)
+    response = HttpResponse(
+        render_sale_receipt_pdf(sale),
+        content_type="application/pdf",
+    )
+    response["Content-Disposition"] = f'inline; filename="{sale.reference}.pdf"'
+    return response
+
+
+def _supplier_invoice_for_manager(request, invoice_id):
+    if not request.user.is_authenticated:
+        return None, JsonResponse({"detail": "Authentication required."}, status=401)
+    try:
+        invoice = SupplierInvoice.objects.select_related(
+            "branch",
+            "purchase_order",
+        ).get(pk=invoice_id)
+    except SupplierInvoice.DoesNotExist:
+        return None, JsonResponse({"detail": "Supplier invoice not found."}, status=404)
+    branch, error = _branch_for_user(request, invoice.branch_id)
+    if error:
+        return None, error
+    error = _require_roles(request, branch, {"branch_manager"})
+    if error:
+        return None, error
+    return invoice, None
+
+
+@require_GET
+def supplier_invoice_reconciliation_pdf(request, invoice_id):
+    invoice, error = _supplier_invoice_for_manager(request, invoice_id)
+    if error:
+        return error
+    response = HttpResponse(
+        invoice_reconciliation_pdf(invoice),
+        content_type="application/pdf",
+    )
+    response["Content-Disposition"] = (
+        f'inline; filename="INV-{invoice.pk:06d}-reconciliation.pdf"'
+    )
+    return response
+
+
+@require_GET
+def supplier_invoice_original(request, invoice_id):
+    invoice, error = _supplier_invoice_for_manager(request, invoice_id)
+    if error:
+        return error
+    document = invoice.original_document
+    if not document:
+        return JsonResponse({"detail": "No original invoice PDF was uploaded."}, status=404)
+    if not document.storage.exists(document.name):
+        return JsonResponse({"detail": "The stored supplier invoice PDF is unavailable."}, status=404)
+    return FileResponse(
+        document.open("rb"),
+        as_attachment=True,
+        filename=f"INV-{invoice.pk:06d}-original.pdf",
+        content_type="application/pdf",
+    )
 
 
 @require_POST
@@ -990,9 +1383,8 @@ def supplier_payment(request, invoice_id):
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
     method = str(data.get("method", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    if amount <= 0 or not method or not reference:
-        return JsonResponse({"detail": "Enter a positive payment, method, and reference."}, status=400)
+    if amount <= 0 or not method:
+        return JsonResponse({"detail": "Enter a positive payment and method."}, status=400)
     with transaction.atomic():
         try:
             invoice = SupplierInvoice.objects.select_for_update().get(pk=invoice_id, branch=branch)
@@ -1002,15 +1394,27 @@ def supplier_payment(request, invoice_id):
             return JsonResponse({"detail": "Payment exceeds the remaining invoice balance."}, status=400)
         invoice.amount_paid += amount
         invoice.save(update_fields=["amount_paid"])
-        payment = SupplierPayment.objects.create(
+        payment = _create_payment(
+            SupplierPayment,
+            "SPAY",
             invoice=invoice,
             amount=amount,
             method=method,
-            reference=reference,
             actor=request.user,
         )
-        _record_audit(request, branch, AuditEvent.Action.PAYMENT_RECORDED, "supplier_invoice", invoice.pk, {"amountPaid": float(invoice.amount_paid)}, reference)
-    return JsonResponse({"paymentId": payment.pk}, status=201)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.PAYMENT_RECORDED,
+            "supplier_invoice",
+            invoice.pk,
+            {"amountPaid": float(invoice.amount_paid)},
+            payment.reference,
+        )
+    return JsonResponse(
+        {"paymentId": payment.pk, "reference": payment.reference},
+        status=201,
+    )
 
 
 @require_POST
@@ -1098,9 +1502,8 @@ def customer_payment(request, sale_id):
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
     method = str(data.get("method", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    if amount <= 0 or not method or not reference:
-        return JsonResponse({"detail": "Enter a positive payment, method, and reference."}, status=400)
+    if amount <= 0 or not method:
+        return JsonResponse({"detail": "Enter a positive payment and method."}, status=400)
     with transaction.atomic():
         try:
             sale = Sale.objects.select_for_update().get(pk=sale_id, branch=branch)
@@ -1113,14 +1516,23 @@ def customer_payment(request, sale_id):
         sale.amount_received += amount
         sale.balance_due -= amount
         sale.save(update_fields=["amount_received", "balance_due"])
-        payment = CustomerPayment.objects.create(
+        payment = _create_payment(
+            CustomerPayment,
+            "PAY",
             sale=sale,
             amount=amount,
             method=method,
-            reference=reference,
             actor=request.user,
         )
-        _record_audit(request, branch, AuditEvent.Action.PAYMENT_RECORDED, "sale", sale.pk, {"balanceDue": float(sale.balance_due)}, reference)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.PAYMENT_RECORDED,
+            "sale",
+            sale.pk,
+            {"balanceDue": float(sale.balance_due)},
+            payment.reference,
+        )
         ExternalIntegrationEvent.objects.get_or_create(
             provider="internal-outbox",
             external_id=f"customer-payment-{payment.pk}",
@@ -1132,11 +1544,14 @@ def customer_payment(request, sale_id):
                     "paymentId": payment.pk,
                     "amount": str(amount),
                     "method": method,
-                    "reference": reference,
+                    "reference": payment.reference,
                 },
             },
         )
-    return JsonResponse({"paymentId": payment.pk}, status=201)
+    return JsonResponse(
+        {"paymentId": payment.pk, "reference": payment.reference},
+        status=201,
+    )
 
 
 @require_POST
@@ -1171,9 +1586,9 @@ def approve_sale(request, sale_id):
                 branch=branch,
                 product=product,
                 quantity__gt=0,
-                expiry__gte=date.today(),
             )
-            .order_by("expiry", "id")
+            .filter(_eligible_batch_expiry())
+            .order_by(models.F("expiry").asc(nulls_last=True), "id")
         )
         if sum(batch.quantity for batch in batches) < sale.quantity:
             return JsonResponse({"detail": "Insufficient unexpired stock to approve this sale."}, status=409)
@@ -1221,11 +1636,12 @@ def approve_sale(request, sale_id):
             "approved_at",
         ])
         if sale.amount_received > 0:
-            CustomerPayment.objects.create(
+            _create_payment(
+                CustomerPayment,
+                "PAY",
                 sale=sale,
                 amount=sale.amount_received,
                 method=sale.payment_method,
-                reference=sale.reference,
                 actor=sale.actor or request.user,
             )
         for batch, quantity in allocations:
@@ -1258,7 +1674,12 @@ def approve_sale(request, sale_id):
             sale.reference,
         )
         _queue_pos_event(sale)
-    return JsonResponse({"sale": _sale_data(sale)})
+    return JsonResponse({
+        "sale": _sale_data(
+            sale,
+            include_cost=_can_view_financials(request, branch),
+        )
+    })
 
 
 @require_POST
@@ -1295,7 +1716,12 @@ def reject_sale(request, sale_id):
             _sale_data(sale),
             sale.reference,
         )
-    return JsonResponse({"sale": _sale_data(sale)})
+    return JsonResponse({
+        "sale": _sale_data(
+            sale,
+            include_cost=_can_view_financials(request, branch),
+        )
+    })
 
 
 def _prescription_data(prescription):
@@ -1322,61 +1748,6 @@ def _prescription_data(prescription):
             for line in prescription.lines.select_related("product").all()
         ],
     }
-
-
-@require_GET
-def barcode_lookup(request):
-    if not request.user.is_authenticated:
-        return JsonResponse({"detail": "Authentication required."}, status=401)
-    value = request.GET.get("value", "").strip()
-    if not value:
-        return JsonResponse({"detail": "Provide a barcode or SKU."}, status=400)
-    product = MedicationProduct.objects.filter(is_active=True).filter(
-        models.Q(barcode__iexact=value) | models.Q(barcode_aliases__value__iexact=value) | models.Q(sku__iexact=value)
-    ).distinct().first()
-    if product is None:
-        return JsonResponse({"detail": "No active product matches this barcode or SKU."}, status=404)
-    return JsonResponse({
-        "product": {
-            "sku": product.sku,
-            "name": product.name,
-            "category": product.category,
-            "barcode": product.barcode,
-            "requiresPrescription": product.requires_prescription,
-            "isControlled": product.is_controlled,
-            "controlledSchedule": product.controlled_schedule,
-        }
-    })
-
-
-@require_POST
-def add_barcode_alias(request):
-    data, error = _json_body(request)
-    if error:
-        return error
-    if not request.user.is_authenticated:
-        return JsonResponse({"detail": "Authentication required."}, status=401)
-    error = _require_catalog_admin(request)
-    if error:
-        return error
-    value = str(data.get("value", "")).strip()
-    sku = str(data.get("sku", "")).strip()
-    try:
-        product = MedicationProduct.objects.get(sku=sku, is_active=True)
-    except MedicationProduct.DoesNotExist:
-        return JsonResponse({"detail": "Active product not found."}, status=404)
-    if not value:
-        return JsonResponse({"detail": "Barcode value is required."}, status=400)
-    alias, created = BarcodeAlias.objects.get_or_create(
-        value=value,
-        defaults={"product": product, "symbology": str(data.get("symbology", ""))},
-    )
-    if not created and alias.product_id != product.id:
-        return JsonResponse({"detail": "Barcode is already assigned to another product."}, status=409)
-    return JsonResponse(
-        {"barcode": alias.value, "sku": product.sku, "created": created},
-        status=201 if created else 200,
-    )
 
 
 @require_GET
@@ -1435,6 +1806,11 @@ def create_prescription(request):
             product = MedicationProduct.objects.get(sku=sku, is_active=True)
         except (ValueError, MedicationProduct.DoesNotExist):
             return JsonResponse({"detail": "Each item needs an active product and whole-number quantity."}, status=400)
+        if product.product_type != MedicationProduct.ProductType.MEDICINE:
+            return JsonResponse(
+                {"detail": "Only medicines can be added to a prescription."},
+                status=400,
+            )
         if quantity <= 0 or sku in seen_skus:
             return JsonResponse({"detail": "Quantities must be positive and each product may appear only once."}, status=400)
         seen_skus.add(sku)
@@ -1519,14 +1895,15 @@ def dispense_prescription(request, prescription_id):
     except (ValueError, TypeError):
         return JsonResponse({"detail": "Enter a valid prescription line, quantity, and amount."}, status=400)
     payment_method = str(data.get("paymentMethod", "")).strip()
-    reference = str(data.get("reference", "")).strip()
-    recipient = str(data.get("patientReference", "")).strip()
     try:
         witness_id = int(data.get("witnessId")) if data.get("witnessId") else None
     except (TypeError, ValueError):
         return JsonResponse({"detail": "Select a valid controlled-medicine witness."}, status=400)
-    if quantity <= 0 or not reference or not recipient or not payment_method:
-        return JsonResponse({"detail": "Quantity, patient reference, payment method, and dispensing reference are required."}, status=400)
+    if quantity <= 0 or not payment_method:
+        return JsonResponse(
+            {"detail": "Enter a positive quantity and payment method."},
+            status=400,
+        )
 
     with transaction.atomic():
         try:
@@ -1537,6 +1914,12 @@ def dispense_prescription(request, prescription_id):
             )
         except (Prescription.DoesNotExist, PrescriptionLine.DoesNotExist):
             return JsonResponse({"detail": "Prescription or item not found."}, status=404)
+        recipient = prescription.patient_reference
+        if not recipient:
+            return JsonResponse(
+                {"detail": "The prescription has no patient reference recorded."},
+                status=409,
+            )
         if prescription.status not in (Prescription.Status.VERIFIED, Prescription.Status.PARTIALLY_DISPENSED):
             return JsonResponse({"detail": "Verify the prescription before dispensing."}, status=409)
         if prescription.expires_date and prescription.expires_date < date.today():
@@ -1558,9 +1941,9 @@ def dispense_prescription(request, prescription_id):
                 branch=branch,
                 product=line.product,
                 quantity__gt=0,
-                expiry__gte=date.today(),
             )
-            .order_by("expiry", "id")
+            .filter(_eligible_batch_expiry())
+            .order_by(models.F("expiry").asc(nulls_last=True), "id")
         )
         if sum(item.quantity for item in batches) < quantity:
             return JsonResponse({"detail": "Insufficient unexpired stock for this prescription item."}, status=400)
@@ -1590,18 +1973,21 @@ def dispense_prescription(request, prescription_id):
             balance_due=total - amount_received,
             payment_method=payment_method,
             recipient=recipient,
-            reference=reference,
+            reference="",
             actor=request.user,
             approval_status=Sale.ApprovalStatus.APPROVED,
             approved_by=request.user,
             approved_at=timezone.now(),
         )
+        sale.reference = _generated_reference("SALE", sale.pk)
+        sale.save(update_fields=["reference"])
         if amount_received > 0:
-            CustomerPayment.objects.create(
+            _create_payment(
+                CustomerPayment,
+                "PAY",
                 sale=sale,
                 amount=amount_received,
                 method=payment_method,
-                reference=reference,
                 actor=request.user,
             )
 
@@ -1614,7 +2000,7 @@ def dispense_prescription(request, prescription_id):
                 type=StockMovement.Type.SALE,
                 quantity=-allocated,
                 recipient=recipient,
-                reference=reference,
+                reference=sale.reference,
                 actor=request.user,
                 sale=sale,
             )
@@ -1652,10 +2038,27 @@ def dispense_prescription(request, prescription_id):
             else Prescription.Status.DISPENSED
         )
         prescription.save(update_fields=["status"])
-        _record_audit(request, branch, AuditEvent.Action.SALE_RECORDED, "prescription_dispense", sale.pk, _sale_data(sale), reference)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.SALE_RECORDED,
+            "prescription_dispense",
+            sale.pk,
+            _sale_data(sale),
+            sale.reference,
+        )
         _queue_pos_event(sale)
 
-    return JsonResponse({"sale": _sale_data(sale), "prescription": _prescription_data(prescription)}, status=201)
+    return JsonResponse(
+        {
+            "sale": _sale_data(
+                sale,
+                include_cost=_can_view_financials(request, branch),
+            ),
+            "prescription": _prescription_data(prescription),
+        },
+        status=201,
+    )
 
 
 @require_POST
@@ -1675,9 +2078,8 @@ def create_purchase_order(request):
         expected_date = date.fromisoformat(data["expectedDate"]) if data.get("expectedDate") else None
     except (Supplier.DoesNotExist, ValueError, TypeError):
         return JsonResponse({"detail": "Select a valid supplier and expected date."}, status=400)
-    number = str(data.get("number", "")).strip()
-    if not number or not isinstance(lines, list) or not lines:
-        return JsonResponse({"detail": "Purchase order number and at least one product line are required."}, status=400)
+    if not isinstance(lines, list) or not lines:
+        return JsonResponse({"detail": "At least one product line is required."}, status=400)
     parsed = []
     seen = set()
     for item in lines:
@@ -1695,12 +2097,14 @@ def create_purchase_order(request):
         order = PurchaseOrder.objects.create(
             branch=branch,
             supplier=supplier,
-            number=number,
+            number=f"TMP-{uuid.uuid4().hex}",
             status=PurchaseOrder.Status.SUBMITTED,
             expected_date=expected_date,
             created_by=request.user,
             submitted_at=timezone.now(),
         )
+        order.number = _generated_reference("PO", order.pk)
+        order.save(update_fields=["number"])
         PurchaseOrderLine.objects.bulk_create([
             PurchaseOrderLine(
                 purchase_order=order,
@@ -1710,7 +2114,15 @@ def create_purchase_order(request):
             )
             for product, quantity, cost in parsed
         ])
-        _record_audit(request, branch, AuditEvent.Action.CREATED, "purchase_order", order.pk, {"status": order.status}, number)
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.CREATED,
+            "purchase_order",
+            order.pk,
+            {"status": order.status},
+            order.number,
+        )
     return JsonResponse({"id": order.pk, "number": order.number, "status": order.status}, status=201)
 
 
@@ -1722,30 +2134,34 @@ def purchase_orders_view(request):
     error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
+    can_view_cost = _can_view_financials(request, branch)
     orders = PurchaseOrder.objects.filter(branch=branch).select_related("supplier").prefetch_related("lines__product")
-    return JsonResponse({"purchaseOrders": [
-        {
+    purchase_orders = []
+    for order in orders:
+        lines = []
+        for line in order.lines.all():
+            line_data = {
+                "id": line.id,
+                "sku": line.product.sku,
+                "name": line.product.name,
+                "productType": line.product.product_type,
+                "quantityOrdered": line.quantity_ordered,
+                "quantityReceived": line.quantity_received,
+                "isControlled": line.product.is_controlled,
+            }
+            if can_view_cost:
+                line_data["unitCost"] = float(line.unit_cost)
+            lines.append(line_data)
+        purchase_orders.append({
             "id": order.id,
             "number": order.number,
             "supplierId": order.supplier_id,
             "supplier": order.supplier.name,
             "status": order.status,
             "expectedDate": order.expected_date.isoformat() if order.expected_date else "",
-            "lines": [
-                {
-                    "id": line.id,
-                    "sku": line.product.sku,
-                    "name": line.product.name,
-                    "quantityOrdered": line.quantity_ordered,
-                    "quantityReceived": line.quantity_received,
-                    "unitCost": float(line.unit_cost),
-                    "isControlled": line.product.is_controlled,
-                }
-                for line in order.lines.all()
-            ],
-        }
-        for order in orders
-    ]})
+            "lines": lines,
+        })
+    return JsonResponse({"purchaseOrders": purchase_orders})
 
 
 @require_POST
@@ -1777,7 +2193,7 @@ def receive_purchase_order(request, order_id):
                     purchase_order=order,
                 )
                 quantity = _whole_number(receipt.get("quantity"), "Received quantity")
-                expiry = date.fromisoformat(receipt.get("expiry", ""))
+                expiry = _batch_expiry(receipt.get("expiry"), line.product.product_type)
                 selling_price = _money(receipt.get("sellingPrice"), "Selling price")
             except (PurchaseOrderLine.DoesNotExist, ValueError, TypeError, AttributeError):
                 return JsonResponse({"detail": "Receipt line, quantity, or expiry date is invalid."}, status=400)
@@ -1854,30 +2270,231 @@ def reorder_suggestions_view(request):
     error = _require_roles(request, branch, {"pharmacist", "branch_manager"})
     if error:
         return error
+    can_view_cost = _can_view_financials(request, branch)
     rows = []
     products = MedicationProduct.objects.filter(is_active=True).prefetch_related("batches")
     for product in products:
         batches = [batch for batch in product.batches.all() if batch.branch_id == branch.id]
         if not batches:
             continue
-        total = sum(batch.quantity for batch in batches if batch.expiry >= date.today())
+        total = sum(
+            batch.quantity for batch in batches
+            if (
+                batch.expiry is not None and batch.expiry >= date.today()
+            ) or (
+                product.product_type == MedicationProduct.ProductType.SKIN_CARE
+                and batch.expiry is None
+            )
+        )
         level = max(batch.reorder_level for batch in batches)
         if total <= level:
             preferred = product.supplier_options.filter(
                 is_preferred=True,
                 supplier__is_active=True,
             ).select_related("supplier").first()
-            rows.append({
+            suggestion = {
                 "sku": product.sku,
                 "name": product.name,
+                "productType": product.product_type,
                 "onHand": total,
                 "reorderLevel": level,
                 "suggestedQuantity": max(0, level * 2 - total),
                 "supplierId": preferred.supplier_id if preferred else None,
                 "supplier": preferred.supplier.name if preferred else "",
-                "unitCost": float(preferred.unit_cost) if preferred else None,
-            })
+            }
+            if can_view_cost:
+                suggestion["unitCost"] = float(preferred.unit_cost) if preferred else None
+            rows.append(suggestion)
     return JsonResponse({"suggestions": rows})
+
+
+def _replenishment_recommendations(branch, as_of=None):
+    as_of = as_of or timezone.localdate()
+    lookback_days = 56
+    recent_days = 28
+    review_buffer_days = 14
+    history_start = as_of - timedelta(days=lookback_days - 1)
+
+    batches_by_product = {}
+    for batch in MedicineBatch.objects.filter(
+        branch=branch,
+        product__is_active=True,
+    ).select_related("product").order_by(
+        models.F("expiry").asc(nulls_last=True),
+        "id",
+    ):
+        batches_by_product.setdefault(batch.product_id, []).append(batch)
+    if not batches_by_product:
+        return []
+
+    products = list(
+        MedicationProduct.objects.filter(
+            pk__in=batches_by_product,
+            is_active=True,
+        ).order_by("sku")
+    )
+    daily_units = {product.sku: [0] * lookback_days for product in products}
+    for sale in Sale.objects.filter(
+        branch=branch,
+        approval_status=Sale.ApprovalStatus.APPROVED,
+        recorded_at__date__gte=history_start,
+        recorded_at__date__lte=as_of,
+    ).values("sku", "quantity", "recorded_at"):
+        day_index = (sale["recorded_at"].date() - history_start).days
+        if sale["sku"] in daily_units and 0 <= day_index < lookback_days:
+            daily_units[sale["sku"]][day_index] += sale["quantity"]
+
+    preferred_suppliers = {
+        mapping.product_id: mapping
+        for mapping in SupplierProduct.objects.filter(
+            product_id__in=batches_by_product,
+            is_preferred=True,
+            supplier__is_active=True,
+        ).select_related("supplier")
+    }
+
+    recommendations = []
+    for product in products:
+        days = daily_units[product.sku]
+        recent_total = sum(days[-recent_days:])
+        previous_total = sum(days[:recent_days])
+        recent_daily = Decimal(recent_total) / Decimal(recent_days)
+        previous_daily = Decimal(previous_total) / Decimal(recent_days)
+        daily_demand = (
+            recent_daily * Decimal("0.7") + previous_daily * Decimal("0.3")
+            if previous_total
+            else recent_daily
+        )
+        sale_days = sum(1 for quantity in days if quantity > 0)
+        total_units_sold = sum(days)
+
+        if sale_days >= 20:
+            confidence = "high"
+            confidence_reason = f"Approved sales on {sale_days} of {lookback_days} days."
+        elif sale_days >= 8:
+            confidence = "medium"
+            confidence_reason = f"Approved sales on {sale_days} of {lookback_days} days."
+        else:
+            confidence = "low"
+            confidence_reason = (
+                f"Sparse approved-sales history ({sale_days} of {lookback_days} days); "
+                "the order target falls back to the configured reorder level."
+            )
+
+        mapping = preferred_suppliers.get(product.pk)
+        lead_time_days = mapping.lead_time_days if mapping else 0
+        horizon_days = lead_time_days + review_buffer_days
+        expected_demand = math.ceil(daily_demand * horizon_days)
+        batches = batches_by_product[product.pk]
+        current_stock = sum(
+            batch.quantity for batch in batches
+            if batch.quantity > 0 and (
+                (batch.expiry is not None and batch.expiry >= as_of)
+                or (
+                    product.product_type == MedicationProduct.ProductType.SKIN_CARE
+                    and batch.expiry is None
+                )
+            )
+        )
+        expiry_quantities_by_date = {}
+        for batch in batches:
+            if (
+                batch.quantity > 0
+                and batch.expiry is not None
+                and as_of <= batch.expiry <= as_of + timedelta(days=30)
+            ):
+                expiry_quantities_by_date[batch.expiry] = (
+                    expiry_quantities_by_date.get(batch.expiry, 0) + batch.quantity
+                )
+        expiring_quantity = sum(expiry_quantities_by_date.values())
+        cumulative_expiring_quantity = 0
+        expiry_risk = 0
+        for expiry_date, quantity in sorted(expiry_quantities_by_date.items()):
+            cumulative_expiring_quantity += quantity
+            days_to_expiry = max((expiry_date - as_of).days, 1)
+            expected_sales_before_expiry = math.ceil(daily_demand * days_to_expiry)
+            expiry_risk = max(
+                expiry_risk,
+                cumulative_expiring_quantity - expected_sales_before_expiry,
+                0,
+            )
+        effective_stock = max(
+            0,
+            current_stock - (expiry_risk if confidence != "low" else 0),
+        )
+        reorder_level = max(batch.reorder_level for batch in batches)
+        target_stock = (
+            reorder_level * 2
+            if confidence == "low"
+            else max(reorder_level * 2, expected_demand)
+        )
+        suggested_quantity = max(0, target_stock - effective_stock)
+
+        reasons = [
+            f"Weighted daily demand: {daily_demand:.2f} units from the last {lookback_days} days "
+            "(recent 28 days weighted 70%, previous 28 days 30%).",
+            f"Target covers {horizon_days} days: {lead_time_days} supplier lead-time days "
+            f"plus a {review_buffer_days}-day review buffer.",
+            f"Target stock {target_stock}; usable stock {effective_stock}; "
+            f"suggested order {suggested_quantity}.",
+        ]
+        if not mapping:
+            reasons.append("No preferred active supplier is configured; lead time is assumed to be 0 days.")
+        if expiry_risk:
+            reasons.append(
+                f"An estimated {expiry_risk} units may remain at risk in lots expiring within 30 days."
+            )
+
+        recommendations.append({
+            "sku": product.sku,
+            "name": product.name,
+            "category": product.category,
+            "productType": product.product_type,
+            "lookbackDays": lookback_days,
+            "salesDays": sale_days,
+            "historicalUnitsSold": total_units_sold,
+            "averageDailyDemand": round(float(daily_demand), 3),
+            "recentDailyDemand": round(float(recent_daily), 3),
+            "previousDailyDemand": round(float(previous_daily), 3),
+            "leadTimeDays": lead_time_days,
+            "expectedDeliveryDate": (
+                as_of + timedelta(days=lead_time_days)
+            ).isoformat(),
+            "reviewBufferDays": review_buffer_days,
+            "forecastHorizonDays": horizon_days,
+            "expectedDemand": expected_demand,
+            "currentStock": current_stock,
+            "effectiveStock": effective_stock,
+            "reorderLevel": reorder_level,
+            "targetStock": target_stock,
+            "expiringWithin30Days": expiring_quantity,
+            "estimatedExpiryRisk": expiry_risk,
+            "suggestedOrderQuantity": suggested_quantity,
+            "supplierId": mapping.supplier_id if mapping else None,
+            "supplier": mapping.supplier.name if mapping else "",
+            "unitCost": float(mapping.unit_cost) if mapping else None,
+            "confidence": confidence,
+            "confidenceReason": confidence_reason,
+            "reasons": reasons,
+            "modelVersion": "weighted-moving-average-v1",
+        })
+    return recommendations
+
+
+@require_GET
+def replenishment_forecast(request):
+    branch, error = _branch_for_user(request, _branch_id(request))
+    if error:
+        return error
+    error = _require_roles(request, branch, {"branch_manager"})
+    if error:
+        return error
+    return JsonResponse({
+        "branchId": branch.id,
+        "asOf": timezone.localdate().isoformat(),
+        "modelVersion": "weighted-moving-average-v1",
+        "recommendations": _replenishment_recommendations(branch),
+    })
 
 
 @require_POST
@@ -1899,7 +2516,15 @@ def create_reorder_draft(request):
     batches = list(MedicineBatch.objects.filter(branch=branch, product=product))
     if not batches:
         return JsonResponse({"detail": "No branch reorder level is configured for this product."}, status=400)
-    total = sum(batch.quantity for batch in batches if batch.expiry >= date.today())
+    total = sum(
+        batch.quantity for batch in batches
+        if (
+            batch.expiry is not None and batch.expiry >= date.today()
+        ) or (
+            product.product_type == MedicationProduct.ProductType.SKIN_CARE
+            and batch.expiry is None
+        )
+    )
     reorder_level = max(batch.reorder_level for batch in batches)
     quantity = max(0, reorder_level * 2 - total)
     if quantity == 0 or total > reorder_level:
@@ -1913,10 +2538,12 @@ def create_reorder_draft(request):
     order = PurchaseOrder.objects.create(
         branch=branch,
         supplier=mapping.supplier,
-        number=f"RO-{branch.code}-{timezone.now():%Y%m%d}-{uuid.uuid4().hex[:6].upper()}",
+        number=f"TMP-{uuid.uuid4().hex}",
         status=PurchaseOrder.Status.DRAFT,
         created_by=request.user,
     )
+    order.number = _generated_reference("PO", order.pk)
+    order.save(update_fields=["number"])
     PurchaseOrderLine.objects.create(
         purchase_order=order,
         product=product,
@@ -1950,16 +2577,49 @@ def submit_purchase_order(request, order_id):
     if error:
         return error
     try:
-        order = PurchaseOrder.objects.get(pk=order_id, branch=branch)
+        order = PurchaseOrder.objects.select_related("branch", "supplier").prefetch_related(
+            "lines__product",
+        ).get(pk=order_id, branch=branch)
     except PurchaseOrder.DoesNotExist:
         return JsonResponse({"detail": "Purchase order not found."}, status=404)
     if order.status != PurchaseOrder.Status.DRAFT:
         return JsonResponse({"detail": "Only draft orders can be submitted."}, status=409)
-    order.status = PurchaseOrder.Status.SUBMITTED
-    order.submitted_at = timezone.now()
-    order.save(update_fields=["status", "submitted_at"])
-    _record_audit(request, branch, AuditEvent.Action.UPDATED, "purchase_order", order.pk, {"status": order.status}, order.number)
-    return JsonResponse({"id": order.pk, "status": order.status})
+    email_queued = False
+    with transaction.atomic():
+        order.status = PurchaseOrder.Status.SUBMITTED
+        order.submitted_at = timezone.now()
+        order.save(update_fields=["status", "submitted_at"])
+        _record_audit(
+            request,
+            branch,
+            AuditEvent.Action.UPDATED,
+            "purchase_order",
+            order.pk,
+            {"status": order.status},
+            order.number,
+        )
+        if order.supplier.email:
+            items = "\n".join(
+                f"- {line.product.sku} | {line.product.name} | quantity {line.quantity_ordered}"
+                for line in order.lines.all()
+            )
+            _, email_queued = _queue_email_notification(
+                f"purchase-order-{order.pk}",
+                EmailNotification.Type.PURCHASE_ORDER,
+                order.supplier.email,
+                f"Purchase order {order.number} from {branch.name}",
+                (
+                    f"Hello {order.supplier.contact_name or order.supplier.name},\n\n"
+                    f"{branch.name} has submitted purchase order {order.number}.\n\n"
+                    f"{items}\n\n"
+                    "Please contact the branch directly with any questions."
+                ),
+            )
+    return JsonResponse({
+        "id": order.pk,
+        "status": order.status,
+        "emailQueued": email_queued,
+    })
 
 
 @require_POST
@@ -1979,9 +2639,8 @@ def create_transfer(request):
     if error:
         return error
     lines = data.get("lines")
-    reference = str(data.get("reference", "")).strip()
-    if not reference or not isinstance(lines, list) or not lines:
-        return JsonResponse({"detail": "Transfer reference and at least one item are required."}, status=400)
+    if not isinstance(lines, list) or not lines:
+        return JsonResponse({"detail": "At least one transfer item is required."}, status=400)
     parsed = []
     seen = set()
     for item in lines:
@@ -1996,8 +2655,10 @@ def create_transfer(request):
             branch=source,
             product=product,
             quantity__gt=0,
-            expiry__gte=date.today(),
-        ).order_by("expiry", "id"))
+        ).filter(_eligible_batch_expiry()).order_by(
+            models.F("expiry").asc(nulls_last=True),
+            "id",
+        ))
         available_quantity = sum(batch.quantity for batch in eligible_batches)
         if available_quantity < quantity:
             return JsonResponse(
@@ -2013,15 +2674,15 @@ def create_transfer(request):
                 outstanding -= allocated
             if outstanding == 0:
                 break
-    if BranchTransfer.objects.filter(source_branch=source, reference__iexact=reference).exists():
-        return JsonResponse({"detail": "That transfer reference has already been used."}, status=409)
     with transaction.atomic():
         transfer = BranchTransfer.objects.create(
             source_branch=source,
             destination_branch=destination,
-            reference=reference,
+            reference=f"TMP-{uuid.uuid4().hex}",
             requested_by=request.user,
         )
+        transfer.reference = _generated_reference("TRF", transfer.pk)
+        transfer.save(update_fields=["reference"])
         transfer.lines.bulk_create([
             BranchTransferLine(
                 transfer=transfer,
@@ -2031,8 +2692,19 @@ def create_transfer(request):
             )
             for product, quantity, source_batch in parsed
         ])
-    _record_audit(request, source, AuditEvent.Action.CREATED, "branch_transfer", transfer.pk, {"destination": destination.code}, reference)
-    return JsonResponse({"id": transfer.pk, "status": transfer.status}, status=201)
+    _record_audit(
+        request,
+        source,
+        AuditEvent.Action.CREATED,
+        "branch_transfer",
+        transfer.pk,
+        {"destination": destination.code},
+        transfer.reference,
+    )
+    return JsonResponse(
+        {"id": transfer.pk, "status": transfer.status, "reference": transfer.reference},
+        status=201,
+    )
 
 
 @require_GET
@@ -2117,7 +2789,14 @@ def dispatch_transfer(request, transfer_id):
         }
         for line in lines:
             batch = locked_batches[line.source_batch_id]
-            if batch.quantity < line.quantity_dispatched or batch.expiry < date.today():
+            if (
+                batch.quantity < line.quantity_dispatched
+                or (
+                    batch.expiry is None
+                    and line.product.product_type != MedicationProduct.ProductType.SKIN_CARE
+                )
+                or (batch.expiry is not None and batch.expiry < date.today())
+            ):
                 return JsonResponse({"detail": f"Insufficient eligible stock for {line.product.sku}."}, status=409)
         for line in lines:
             batch = locked_batches[line.source_batch_id]
@@ -2287,12 +2966,17 @@ def receive_transfer(request, transfer_id):
 
 @require_GET
 def analytics_report(request):
-    branch, error = _branch_for_user(request, _branch_id(request))
+    branch, error = _branch_for_user(
+        request,
+        _branch_id(request),
+        allow_admin_cross_branch=True,
+    )
     if error:
         return error
-    error = _require_roles(request, branch, {"branch_manager"})
-    if error:
-        return error
+    if not request.user.is_superuser:
+        error = _require_roles(request, branch, {"branch_manager"})
+        if error:
+            return error
     try:
         start = date.fromisoformat(request.GET.get("start", (date.today() - timedelta(days=30)).isoformat()))
         end = date.fromisoformat(request.GET.get("end", date.today().isoformat()))
@@ -2317,18 +3001,160 @@ def analytics_report(request):
         }
         for item in movements
     ]
-    sales = Sale.objects.filter(branch=branch, recorded_at__date__gte=start, recorded_at__date__lte=end)
+    sales = Sale.objects.filter(
+        branch=branch,
+        recorded_at__date__gte=start,
+        recorded_at__date__lte=end,
+        approval_status=Sale.ApprovalStatus.APPROVED,
+    )
+    sales_list = list(sales)
+    previous_period_days = (end - start).days + 1
+    previous_start = start - timedelta(days=previous_period_days)
+    previous_sales = Sale.objects.filter(
+        branch=branch,
+        recorded_at__date__gte=previous_start,
+        recorded_at__date__lt=start,
+        approval_status=Sale.ApprovalStatus.APPROVED,
+    )
+    previous_sales_amount = sum(
+        previous_sales.values_list("sale_amount", flat=True),
+        Decimal("0.00"),
+    )
+    sales_by_day = {
+        (start + timedelta(days=offset)).isoformat(): {
+            "salesAmount": Decimal("0.00"),
+            "grossProfit": Decimal("0.00"),
+        }
+        for offset in range(previous_period_days)
+    }
+    product_totals = {}
+    for sale in sales_list:
+        day = sale.recorded_at.date().isoformat()
+        sales_by_day[day]["salesAmount"] += sale.sale_amount
+        sales_by_day[day]["grossProfit"] += sale.sale_amount - sale.cost_amount
+    for line in SaleLine.objects.filter(sale__in=sales).select_related(
+        "sale", "batch__product"
+    ):
+        product = line.batch.product
+        totals = product_totals.setdefault(
+            product.sku,
+            {
+                "sku": product.sku,
+                "product": product.name,
+                "category": product.category,
+                "unitsSold": 0,
+                "salesAmount": Decimal("0.00"),
+                "grossProfit": Decimal("0.00"),
+            },
+        )
+        totals["unitsSold"] += line.quantity
+        totals["salesAmount"] += line.selling_price * line.quantity
+        totals["grossProfit"] += (
+            line.selling_price - line.purchase_cost
+        ) * line.quantity
+    sales_amount = sum(
+        (sale.sale_amount for sale in sales_list),
+        Decimal("0.00"),
+    )
+    gross_profit = sum(
+        (sale.sale_amount - sale.cost_amount for sale in sales_list),
+        Decimal("0.00"),
+    )
+    sales_change_percent = (
+        float((sales_amount - previous_sales_amount) * Decimal("100") / previous_sales_amount)
+        if previous_sales_amount
+        else None
+    )
+    today = timezone.localdate()
+    risk_batches = list(
+        MedicineBatch.objects.filter(branch=branch).select_related("product")
+    )
+    stock_by_product = {}
+    out_of_stock_lots = 0
+    low_stock_lots = 0
+    expiring_lots = 0
+    for batch in risk_batches:
+        is_expired = batch.expiry is not None and batch.expiry < today
+        if not is_expired:
+            if batch.quantity == 0:
+                out_of_stock_lots += 1
+            elif batch.quantity <= batch.reorder_level:
+                low_stock_lots += 1
+            if (
+                batch.quantity > 0
+                and batch.expiry is not None
+                and batch.expiry <= today + timedelta(days=90)
+            ):
+                expiring_lots += 1
+        if batch.product_id not in stock_by_product:
+            stock_by_product[batch.product_id] = {
+                "isActive": batch.product.is_active,
+                "onHand": 0,
+                "reorderLevel": 0,
+            }
+        stock = stock_by_product[batch.product_id]
+        if (
+            batch.expiry is not None and batch.expiry >= today
+        ) or (
+            batch.product.product_type == MedicationProduct.ProductType.SKIN_CARE
+            and batch.expiry is None
+        ):
+            stock["onHand"] += batch.quantity
+        stock["reorderLevel"] = max(stock["reorderLevel"], batch.reorder_level)
+    reorder_product_count = sum(
+        stock["isActive"] and stock["onHand"] <= stock["reorderLevel"]
+        for stock in stock_by_product.values()
+    )
     return JsonResponse({
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "summary": {
             "movementCount": len(movement_data),
             "unitsReceived": sum(row["quantity"] for row in movement_data if row["quantity"] > 0),
             "unitsIssued": -sum(row["quantity"] for row in movement_data if row["quantity"] < 0),
-            "salesCount": sales.count(),
-            "salesAmount": float(sum(sales.values_list("sale_amount", flat=True), Decimal("0.00"))),
-            "grossProfit": float(sum((sale.sale_amount - sale.cost_amount for sale in sales), Decimal("0.00"))),
-            "outstandingBalance": float(sum(Sale.objects.filter(branch=branch).values_list("balance_due", flat=True), Decimal("0.00"))),
+            "salesCount": len(sales_list),
+            "salesAmount": float(sales_amount),
+            "grossProfit": float(gross_profit),
+            "outstandingBalance": float(sum(
+                Sale.objects.filter(
+                    branch=branch,
+                    approval_status=Sale.ApprovalStatus.APPROVED,
+                ).values_list("balance_due", flat=True),
+                Decimal("0.00"),
+            )),
+            "pendingApprovalCount": Sale.objects.filter(
+                branch=branch,
+                recorded_at__date__gte=start,
+                recorded_at__date__lte=end,
+                approval_status=Sale.ApprovalStatus.PENDING,
+            ).count(),
+            "previousPeriodSalesAmount": float(previous_sales_amount),
+            "salesChangePercent": sales_change_percent,
         },
+        "stockRisk": {
+            "outOfStockLots": out_of_stock_lots,
+            "lowStockLots": low_stock_lots,
+            "expiringLots": expiring_lots,
+            "reorderProducts": reorder_product_count,
+        },
+        "salesTrend": [
+            {
+                "date": day,
+                "salesAmount": float(totals["salesAmount"]),
+                "grossProfit": float(totals["grossProfit"]),
+            }
+            for day, totals in sales_by_day.items()
+        ],
+        "topProducts": sorted(
+            (
+                {
+                    **totals,
+                    "salesAmount": float(totals["salesAmount"]),
+                    "grossProfit": float(totals["grossProfit"]),
+                }
+                for totals in product_totals.values()
+            ),
+            key=lambda product: (-product["unitsSold"], product["sku"]),
+        )[:10],
         "movements": movement_data,
         "controlledRegister": [
             {

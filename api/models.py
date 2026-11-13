@@ -1,5 +1,12 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
+
+
+def generate_product_sku():
+    return f"SKU-{uuid.uuid4().hex[:12].upper()}"
 
 
 class Branch(models.Model):
@@ -137,11 +144,29 @@ class AuditEvent(models.Model):
 
 
 class MedicationProduct(models.Model):
-    sku = models.CharField(max_length=40, unique=True)
-    barcode = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    class ProductType(models.TextChoices):
+        MEDICINE = "medicine", "Medicine"
+        SKIN_CARE = "skin_care", "Skin care"
+
+    sku = models.CharField(max_length=40, unique=True, default=generate_product_sku)
     name = models.CharField(max_length=160)
     category = models.CharField(max_length=100)
+    product_type = models.CharField(
+        max_length=20,
+        choices=ProductType.choices,
+        default=ProductType.MEDICINE,
+    )
     unit = models.CharField(max_length=40, default="unit")
+    brand = models.CharField(max_length=120, blank=True)
+    skin_type = models.CharField(max_length=120, blank=True)
+    skin_concerns = models.CharField(max_length=200, blank=True)
+    key_ingredients = models.TextField(blank=True)
+    usage_instructions = models.TextField(blank=True)
+    warnings = models.TextField(blank=True)
+    period_after_opening_months = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
     requires_prescription = models.BooleanField(default=False)
     is_controlled = models.BooleanField(default=False)
     controlled_schedule = models.CharField(max_length=40, blank=True)
@@ -154,21 +179,6 @@ class MedicationProduct(models.Model):
 
     def __str__(self):
         return f"{self.sku} — {self.name}"
-
-
-class BarcodeAlias(models.Model):
-    product = models.ForeignKey(
-        MedicationProduct,
-        on_delete=models.PROTECT,
-        related_name="barcode_aliases",
-    )
-    value = models.CharField(max_length=80, unique=True)
-    symbology = models.CharField(max_length=32, blank=True)
-    is_primary = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"{self.value} — {self.product.sku}"
 
 
 class MedicineBatch(models.Model):
@@ -185,7 +195,7 @@ class MedicineBatch(models.Model):
     batch = models.CharField(max_length=80)
     quantity = models.PositiveIntegerField(default=0)
     reorder_level = models.PositiveIntegerField(default=0)
-    expiry = models.DateField()
+    expiry = models.DateField(null=True, blank=True)
     supplier = models.CharField(max_length=160, blank=True)
     reference = models.CharField(max_length=100, blank=True)
     purchase_cost = models.DecimalField(max_digits=12, decimal_places=2)
@@ -277,6 +287,7 @@ class Sale(models.Model):
     )
     approval_amount_received = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     approval_payment_method = models.CharField(max_length=40, blank=True)
+    client_request_id = models.UUIDField(null=True, blank=True)
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
@@ -297,6 +308,12 @@ class Sale(models.Model):
 
     class Meta:
         ordering = ["-recorded_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "client_request_id"],
+                name="unique_sale_client_request_per_branch",
+            ),
+        ]
 
 
 class SaleLine(models.Model):
@@ -422,6 +439,10 @@ class SupplierInvoice(models.Model):
     invoice_amount = models.DecimalField(max_digits=12, decimal_places=2)
     amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     due_date = models.DateField()
+    original_document = models.FileField(
+        upload_to="supplier-invoices/%Y/%m/",
+        blank=True,
+    )
     reconciliation_status = models.CharField(
         max_length=16,
         choices=ReconciliationStatus.choices,
@@ -456,6 +477,38 @@ class SupplierInvoice(models.Model):
                 name="unique_branch_supplier_invoice",
             )
         ]
+
+
+class EmailNotification(models.Model):
+    class Type(models.TextChoices):
+        SALE_RECEIPT = "sale_receipt", "Sale receipt notice"
+        PURCHASE_ORDER = "purchase_order", "Purchase order"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Sent"
+        FAILED = "failed", "Failed"
+
+    event_key = models.CharField(max_length=120, unique=True)
+    notification_type = models.CharField(max_length=24, choices=Type.choices)
+    recipient_email = models.EmailField()
+    subject = models.CharField(max_length=200)
+    body = models.TextField()
+    status = models.CharField(
+        max_length=12,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+    attempts = models.PositiveSmallIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    processing_started_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
 
 
 class SupplierPayment(models.Model):
