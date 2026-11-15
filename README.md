@@ -124,6 +124,17 @@ See the [PostgreSQL deployment guide](docs/POSTGRESQL-DEPLOYMENT.md) for product
 
 If email notifications are enabled, configure an SMTP relay and schedule the `send_email_notifications` Django management command. A queued message is not proof of delivery.
 
+DEMO LOGIN DETAILS (USE THIS TO TEST)
+Admin Account:
+Username: admin
+Password: password
+Pharmacist Account:
+Username: pharmacist1
+Password: password@pharm
+Cashier Account:
+Username: cashier1
+Password: password@cash
+
 ## License
 
 No license is currently specified. Unless a license is added to this repository, reuse and redistribution are not granted by this README.
